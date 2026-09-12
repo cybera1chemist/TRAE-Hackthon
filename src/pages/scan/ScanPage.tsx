@@ -1,35 +1,50 @@
-import { useCallback, useReducer } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState, type Dispatch } from 'react'
 import { useParams } from 'react-router-dom'
 import { Button } from '@/ui'
-import { createMockAIProvider, type AIErrorCode } from '@/infra/ai'
+import { createAIProvider, type AIErrorCode } from '@/infra/ai'
+import { getDataLayer } from '@/application/data/dataLayer'
+import { emitDataChanged } from '@/application/data/dataBus'
+import type { BBox, Dish, Restaurant } from '@/domain/entities'
 import {
+  analyzeImagePrecheck,
+  applyMatchResults,
+  bboxOverlapRatio,
   canConfirmSave,
+  computeMenuDiff,
   createInitialDraft,
+  cropRegionToDataUrl,
+  groupMenuLines,
+  makeDishMatcher,
   pendingLowConfidence,
+  saveScan,
   scanDraftReducer,
   toLineDrafts,
   validateImageFiles,
   type MenuLineDraft,
+  type ScanEvent,
   type ScanImageSlot,
+  type SaveScanResult,
+  type UnreadableRegion,
 } from '@/features/scan-menu'
 
 /**
- * /scan/:rid? 页面骨架（T3-01/03 prep harness）。
- * 当前仅打通 状态机 + Mock OCR 全链路，供开发自测：
- * - 预检像素级分析待 image worker（Agent-3）提供 decode 后接入本 feature 纯函数；
- * - 匹配列与保存落库待 Agent-1 matcher.ts + DishRepo.upsertFromOcr 真实现后接线（TODO(T3-04/05)）；
- * - 增量扫描历史 diff 由 computeMenuDiff 在 OCR_SUCCESS 前计算（TODO(T3-06)）。
+ * /scan/:rid? 页面（T3-01/03/04/05/08）：
+ * - 店铺选择/新建（无 :rid 时）；多图 ≤10/张 ≤10MB；blur/glare/tooDark 预检提示（EC-MENU-01/02）；
+ * - OCR 走 createAIProvider（VITE_AI_MODE=mock/bff/direct）；
+ * - 识别结果经 applyMatchResults 接 Agent-1 matchDish（exact 自动关联可撤销 / fuzzy 须确认 / new 决议），
+ *   并用 computeMenuDiff 出增量摘要（EC-MENU-05，仅确认差异）；
+ * - 确认页（T3-03）：分区折叠 + 其他区（酒水/茶位）默认折叠（EC-MENU-04）、菜名/价格行内编辑、
+ *   不可读区块框选重扫（RESCAN_MERGE 替换重叠行）、手添行、低置信（<0.5）决议门禁；
+ * - 保存落库走 saveScan workflow（upsertFromOcr + BlobStore）。
  */
 
-function makeSlot(file: File): ScanImageSlot {
-  return {
-    id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    previewUrl: URL.createObjectURL(file),
-    sizeBytes: file.size,
-    fileName: file.name,
-    precheck: { blur: false, glare: false, tooDark: false },
-    rotation: 0,
-  }
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result as string)
+    reader.onerror = () => reject(new Error(`读取图片失败: ${file.name}`))
+    reader.readAsDataURL(file)
+  })
 }
 
 /** 置信度色档（PRD EC-MENU：<0.5 强制处理 / 0.5–0.8 关注 / 其余正常） */
@@ -40,27 +55,458 @@ function lineTone(line: MenuLineDraft): string {
   return 'text-ink-muted'
 }
 
+/** 匹配结果徽标（T3-04：exact 自动关联 / fuzzy 须确认 / new 新菜） */
+function matchBadge(line: MenuLineDraft): string | null {
+  if (line.kind !== 'dish') return null
+  if (line.match.type === 'exact') return '已关联'
+  if (line.match.type === 'fuzzy') return `疑似同款 ${Math.round((line.match.score ?? 0) * 100)}%`
+  if (line.match.type === 'new') return '新菜'
+  return null
+}
+
+const REJECT_REASON_TEXT: Record<string, string> = {
+  TYPE_UNSUPPORTED: '格式不支持',
+  SIZE_EXCEEDED: '单张超过 10MB',
+  COUNT_EXCEEDED: '超过 10 张上限',
+}
+
+/** 确认页行卡（T3-03）：菜名/价格行内编辑 + 决议操作；低置信色档（EC-MENU） */
+function LineCard({ line, dispatch }: { line: MenuLineDraft; dispatch: Dispatch<ScanEvent> }) {
+  const deleted = line.decision === 'deleted'
+  const badge = matchBadge(line)
+  const candidates = line.match.candidates
+  return (
+    <li
+      className={`rounded-lg border border-line bg-bg p-2 text-sm ${deleted ? 'opacity-50' : ''}`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <input
+          value={line.name}
+          aria-label="菜名"
+          disabled={deleted}
+          className="min-w-0 flex-1 bg-transparent outline-none"
+          onChange={(e) =>
+            dispatch({ type: 'EDIT_LINE', lineKey: line.lineKey, patch: { name: e.target.value } })
+          }
+        />
+        <span className={`shrink-0 ${lineTone(line)}`}>
+          {badge ? `${badge} · ` : ''}
+          {line.confidence.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-1 flex items-center justify-between gap-2 text-xs text-ink-muted">
+        <span className="min-w-0 truncate">{line.spec ?? ''}</span>
+        <span className="flex shrink-0 items-center gap-0.5">
+          ¥
+          <input
+            type="number"
+            inputMode="decimal"
+            aria-label="价格"
+            disabled={deleted}
+            defaultValue={line.price ?? ''}
+            onBlur={(e) =>
+              dispatch({
+                type: 'EDIT_LINE',
+                lineKey: line.lineKey,
+                patch: { price: e.target.value.trim() === '' ? null : Number(e.target.value) },
+              })
+            }
+            className="w-16 rounded border border-line bg-surface px-1 py-0.5 text-right text-xs outline-none focus:border-primary"
+          />
+        </span>
+      </div>
+      {line.match.type === 'fuzzy' && candidates != null && candidates.length > 0 && (
+        <p className="mt-1 text-xs text-gold">相似菜品：{candidates.join('、')}</p>
+      )}
+      <div className="mt-1 flex justify-end gap-3 text-xs text-primary">
+        {deleted ? (
+          <button
+            type="button"
+            onClick={() =>
+              dispatch({ type: 'SET_DECISION', lineKey: line.lineKey, decision: 'keptSeparate' })
+            }
+          >
+            恢复
+          </button>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="text-avoid"
+              onClick={() => dispatch({ type: 'DELETE_LINE', lineKey: line.lineKey })}
+            >
+              删除
+            </button>
+            {line.match.type === 'fuzzy' && (
+              <button
+                type="button"
+                className="text-gold"
+                onClick={() =>
+                  dispatch({ type: 'SET_DECISION', lineKey: line.lineKey, decision: 'merged' })
+                }
+              >
+                合并到相似菜
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() =>
+                dispatch({ type: 'SET_DECISION', lineKey: line.lineKey, decision: 'keptSeparate' })
+              }
+            >
+              {line.match.type === 'exact' && line.decision === 'linked'
+                ? '取消关联'
+                : '保留为新菜'}
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                dispatch({ type: 'SET_DECISION', lineKey: line.lineKey, decision: 'ignored' })
+              }
+            >
+              忽略
+            </button>
+          </>
+        )}
+      </div>
+    </li>
+  )
+}
+
+/**
+ * 框选重扫面板（EC-MENU-04）：按原图方向展示（AI 输入未旋转），拖拽框选区域 →
+ * onConfirm(imageIndex, region)；不可读区块以虚线框标出。
+ */
+function RescanPanel({
+  images,
+  unreadable,
+  busy,
+  error,
+  onConfirm,
+}: {
+  images: ScanImageSlot[]
+  unreadable: UnreadableRegion[]
+  busy: boolean
+  error: string | null
+  onConfirm: (imageIndex: number, region: BBox) => void
+}) {
+  const [idx, setIdx] = useState(0)
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null)
+  const [start, setStart] = useState<{ x: number; y: number } | null>(null)
+  const [rect, setRect] = useState<BBox | null>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+
+  if (images.length === 0) return null
+  const clamped = Math.min(idx, images.length - 1)
+  const img = images[clamped]
+  const pct = (v: number, total: number) => `${(v / total) * 100}%`
+  const toNatural = (clientX: number, clientY: number) => {
+    const el = boxRef.current
+    if (!el || !natural) return null
+    const r = el.getBoundingClientRect()
+    return {
+      x: ((clientX - r.left) / r.width) * natural.w,
+      y: ((clientY - r.top) / r.height) * natural.h,
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-xl border border-line bg-surface p-3">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-medium">识别不全？在图上框选区域重扫</p>
+        {unreadable.length > 0 && (
+          <span className="rounded bg-avoid/10 px-2 py-0.5 text-xs text-avoid">
+            {unreadable.length} 个不可读区块（虚线框）
+          </span>
+        )}
+      </div>
+      {images.length > 1 && (
+        <div className="flex gap-1 overflow-x-auto">
+          {images.map((im, i) => (
+            <button
+              key={im.id}
+              type="button"
+              aria-label={`切换到第 ${i + 1} 张`}
+              className={`relative h-12 w-9 shrink-0 overflow-hidden rounded border ${
+                i === clamped ? 'border-primary' : 'border-line'
+              }`}
+              onClick={() => {
+                setIdx(i)
+                setRect(null)
+                setStart(null)
+              }}
+            >
+              <img src={im.previewUrl} alt="" className="h-full w-full object-cover" />
+              {unreadable.some((u) => u.imageIndex === i) && (
+                <span className="absolute top-0 right-0 bg-avoid px-0.5 text-[9px] text-white">
+                  !
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+      <div
+        ref={boxRef}
+        className={`relative touch-none ${busy ? 'opacity-60' : ''}`}
+        onPointerDown={(e) => {
+          if (busy) return
+          const p = toNatural(e.clientX, e.clientY)
+          if (!p) return
+          e.currentTarget.setPointerCapture(e.pointerId)
+          setStart(p)
+          setRect({ x: p.x, y: p.y, w: 0, h: 0 })
+        }}
+        onPointerMove={(e) => {
+          if (!start) return
+          const p = toNatural(e.clientX, e.clientY)
+          if (!p || !start) return
+          setRect({
+            x: Math.min(start.x, p.x),
+            y: Math.min(start.y, p.y),
+            w: Math.abs(p.x - start.x),
+            h: Math.abs(p.y - start.y),
+          })
+        }}
+        onPointerUp={() => {
+          setStart(null)
+          // 过小视为误触，放弃框选
+          if (rect && natural && (rect.w < natural.w * 0.02 || rect.h < natural.h * 0.02)) {
+            setRect(null)
+          }
+        }}
+      >
+        <img
+          src={img.previewUrl}
+          alt={`菜单图 ${clamped + 1}`}
+          draggable={false}
+          className="w-full select-none"
+          onLoad={(e) =>
+            setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })
+          }
+        />
+        {natural &&
+          unreadable
+            .filter((u) => u.imageIndex === clamped)
+            .map((u, i) => (
+              <div
+                key={i}
+                className="pointer-events-none absolute border-2 border-dashed border-avoid bg-avoid/10"
+                style={{
+                  left: pct(u.bbox.x, natural.w),
+                  top: pct(u.bbox.y, natural.h),
+                  width: pct(u.bbox.w, natural.w),
+                  height: pct(u.bbox.h, natural.h),
+                }}
+              />
+            ))}
+        {rect && natural && (
+          <div
+            className="pointer-events-none absolute border-2 border-primary bg-primary/10"
+            style={{
+              left: pct(rect.x, natural.w),
+              top: pct(rect.y, natural.h),
+              width: pct(rect.w, natural.w),
+              height: pct(rect.h, natural.h),
+            }}
+          />
+        )}
+      </div>
+      {error && <p className="text-xs text-avoid">{error}</p>}
+      <div className="flex gap-2">
+        <Button
+          variant="ghost"
+          className="flex-1"
+          disabled={busy || !rect}
+          onClick={() => setRect(null)}
+        >
+          清除框选
+        </Button>
+        <Button
+          className="flex-1"
+          disabled={busy || !rect}
+          onClick={() => rect && onConfirm(clamped, rect)}
+        >
+          {busy ? '重扫中…' : '重扫此区域'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/** 店铺选择/新建（T3-01）：联想搜索 + 无结果时新建；选中后写入草稿（不动 URL，避免重挂载丢草稿） */
+function RestaurantPicker({ onPicked }: { onPicked: (id: string) => void }) {
+  const [kw, setKw] = useState('')
+  const [results, setResults] = useState<Restaurant[]>([])
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    const k = kw.trim()
+    if (!k) {
+      setResults([])
+      return
+    }
+    const timer = setTimeout(() => {
+      void getDataLayer()
+        .then((layer) => layer.repos.restaurants.search(k, 5))
+        .then(setResults)
+        .catch(() => setResults([]))
+    }, 250)
+    return () => clearTimeout(timer)
+  }, [kw])
+
+  const createNew = async () => {
+    const name = kw.trim()
+    if (!name || busy) return
+    setBusy(true)
+    try {
+      const layer = await getDataLayer()
+      const created = await layer.repos.restaurants.create({ name })
+      onPicked(created.id)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const hasExact = results.some((r) => r.name === kw.trim())
+
+  return (
+    <div className="space-y-2 rounded-xl border border-line bg-surface p-3">
+      <p className="text-sm font-medium text-ink">先选择店铺</p>
+      <input
+        value={kw}
+        onChange={(e) => setKw(e.target.value)}
+        placeholder="输入店铺名/别名搜索，或直接输入新店名"
+        aria-label="店铺名称"
+        className="w-full rounded-lg border border-line bg-bg px-3 py-2 text-sm outline-none focus:border-primary"
+      />
+      {results.length > 0 && (
+        <ul className="space-y-1">
+          {results.map((r) => (
+            <li key={r.id}>
+              <button
+                type="button"
+                className="w-full rounded-lg px-2 py-1.5 text-left text-sm hover:bg-bg"
+                onClick={() => onPicked(r.id)}
+              >
+                {r.name}
+                {r.city ? <span className="ml-1 text-xs text-ink-muted">{r.city}</span> : null}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {kw.trim() && !hasExact && (
+        <Button
+          variant="secondary"
+          className="w-full"
+          disabled={busy}
+          onClick={() => void createNew()}
+        >
+          新建店铺「{kw.trim()}」
+        </Button>
+      )}
+    </div>
+  )
+}
+
 export function Component() {
   const { rid } = useParams()
   const [draft, dispatch] = useReducer(scanDraftReducer, undefined, () => createInitialDraft(rid))
+  const filesRef = useRef(new Map<string, File>())
+  const [rejectNotice, setRejectNotice] = useState<string | null>(null)
+  // 框选重扫（EC-MENU-04）：匹配基准与首扫一致（同店现存菜品），重扫序号保证 lineKey 唯一
+  const existingRef = useRef<Dish[]>([])
+  const rescanSeqRef = useRef(0)
+  const [rescanBusy, setRescanBusy] = useState(false)
+  const [rescanError, setRescanError] = useState<string | null>(null)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set(['other']))
 
-  const onPickFiles = useCallback((files: FileList | null) => {
-    if (!files || files.length === 0) return
-    const all = Array.from(files)
-    const metas = all.map((f) => ({ name: f.name, type: f.type, size: f.size }))
-    const validations = validateImageFiles(metas, 0)
-    const slots = validations.filter((v) => v.ok).map((v) => makeSlot(all[v.index]))
-    if (slots.length > 0) dispatch({ type: 'ADD_IMAGES', slots })
+  const onPickFiles = useCallback(
+    (files: FileList | null) => {
+      if (!files || files.length === 0) return
+      const all = Array.from(files)
+      const validations = validateImageFiles(
+        all.map((f) => ({ name: f.name, type: f.type, size: f.size })),
+        draft.images.length,
+      )
+      const rejected = validations.filter((v) => !v.ok)
+      setRejectNotice(
+        rejected.length > 0
+          ? `已拒绝 ${rejected.length} 张：${[...new Set(rejected.map((v) => REJECT_REASON_TEXT[v.reason ?? '']))].join('、')}`
+          : null,
+      )
+      const slots: ScanImageSlot[] = validations
+        .filter((v) => v.ok)
+        .map((v) => {
+          const file = all[v.index]
+          const slot: ScanImageSlot = {
+            id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            previewUrl: URL.createObjectURL(file),
+            sizeBytes: file.size,
+            fileName: file.name,
+            precheck: { blur: false, glare: false, tooDark: false },
+            rotation: 0,
+          }
+          filesRef.current.set(slot.id, file)
+          return slot
+        })
+      if (slots.length === 0) return
+      dispatch({ type: 'ADD_IMAGES', slots })
+      // 像素级预检（blur/glare/tooDark）异步补齐（EC-MENU-02 提示性，不阻塞）
+      for (const slot of slots) {
+        const file = filesRef.current.get(slot.id)
+        if (!file) continue
+        void analyzeImagePrecheck(file).then(({ blur, glare, tooDark, width, height }) => {
+          dispatch({
+            type: 'UPDATE_PRECHECK',
+            imageId: slot.id,
+            precheck: { blur, glare, tooDark },
+            width,
+            height,
+          })
+        })
+      }
+    },
+    [draft.images.length],
+  )
+
+  const removeImage = useCallback((imageId: string) => {
+    filesRef.current.delete(imageId)
+    dispatch({ type: 'REMOVE_IMAGE', imageId })
+  }, [])
+
+  const pickRestaurant = useCallback((id: string) => {
+    dispatch({ type: 'SELECT_RESTAURANT', restaurantId: id })
   }, [])
 
   const onStartOcr = useCallback(async () => {
+    const files = draft.images
+      .map((img) => filesRef.current.get(img.id))
+      .filter((f): f is File => f != null)
+    if (files.length === 0) return
     dispatch({ type: 'START_OCR' })
-    const ai = createMockAIProvider()
     try {
-      // TODO(T3-04): images 走 fileToBase64；匹配接 Agent-1 matcher 后为每行补 matchResult
-      const resp = await ai.scanMenu({ images: [], restaurantId: rid })
+      const [layer, images] = await Promise.all([
+        getDataLayer(),
+        Promise.all(files.map(fileToDataUrl)),
+      ])
+      // 匹配范围仅同店（TDD §3.4）：以本店现存菜品为基准做关联与增量 diff
+      const existing = draft.restaurantId
+        ? await layer.repos.dishes.listByRestaurant(draft.restaurantId)
+        : []
+      existingRef.current = existing
+      const resp = await createAIProvider().scanMenu({ images, restaurantId: draft.restaurantId })
       const { lines, unreadable } = toLineDrafts(resp)
-      dispatch({ type: 'OCR_SUCCESS', lines, unreadable })
+      const matched = applyMatchResults(lines, existing)
+      const diff = computeMenuDiff(matched, existing, makeDishMatcher())
+      dispatch({
+        type: 'OCR_SUCCESS',
+        lines: matched,
+        unreadable,
+        isIncremental: existing.length > 0,
+        diffSummary: diff.summary,
+      })
     } catch (err) {
       const error = err as { code?: AIErrorCode; retriable?: boolean; message?: string }
       dispatch({
@@ -72,9 +518,93 @@ export function Component() {
         },
       })
     }
-  }, [rid])
+  }, [draft.images, draft.restaurantId])
+
+  /** 框选重扫（EC-MENU-04）：裁剪区域 → scanMenu → 匹配 → RESCAN_MERGE 替换重叠行 */
+  const onRescanRegion = useCallback(
+    async (imageIndex: number, region: BBox) => {
+      if (rescanBusy) return
+      const file = filesRef.current.get(draft.images[imageIndex]?.id ?? '')
+      if (!file) {
+        setRescanError('原图缺失，无法重扫该区域')
+        return
+      }
+      setRescanBusy(true)
+      setRescanError(null)
+      try {
+        const cropped = await cropRegionToDataUrl(file, region)
+        const resp = await createAIProvider().scanMenu({
+          images: [cropped],
+          restaurantId: draft.restaurantId,
+        })
+        const { lines, unreadable } = toLineDrafts(resp)
+        rescanSeqRef.current += 1
+        const remapped = lines.map((l, i) => ({
+          ...l,
+          lineKey: `temp-rescan-${rescanSeqRef.current}-${i}`,
+          imageIndex,
+          rescanOf: region,
+        }))
+        const matched = applyMatchResults(remapped, existingRef.current)
+        // 与 reducer 相同口径（重叠 ≥0.5）预估替换后的行集合，用于重算增量摘要
+        const replacedKeys = new Set(
+          draft.lines
+            .filter(
+              (l) =>
+                l.imageIndex === imageIndex &&
+                l.bbox != null &&
+                bboxOverlapRatio(region, l.bbox) >= 0.5,
+            )
+            .map((l) => l.lineKey),
+        )
+        const nextLines = [...draft.lines.filter((l) => !replacedKeys.has(l.lineKey)), ...matched]
+        const diff = computeMenuDiff(nextLines, existingRef.current, makeDishMatcher())
+        dispatch({
+          type: 'RESCAN_MERGE',
+          imageIndex,
+          region,
+          lines: matched,
+          unreadable,
+          diffSummary: diff.summary,
+        })
+      } catch (err) {
+        setRescanError(err instanceof Error ? err.message : '重扫失败，请重试')
+      } finally {
+        setRescanBusy(false)
+      }
+    },
+    [draft, rescanBusy],
+  )
 
   const pending = pendingLowConfidence(draft)
+  const diffSummary = draft.diffSummary
+  const [saveResult, setSaveResult] = useState<SaveScanResult | null>(null)
+  const warnedImages = draft.images.filter(
+    (img) => img.precheck.blur || img.precheck.glare || img.precheck.tooDark,
+  )
+
+  /** 保存落库（T3-05/08 workflow）：失败 SAVE_FAILURE 回 confirm，草稿不丢 */
+  const onSave = useCallback(async () => {
+    dispatch({ type: 'START_SAVING' })
+    try {
+      const layer = await getDataLayer()
+      const images = draft.images
+        .map((img) => {
+          const file = filesRef.current.get(img.id)
+          return file ? { imageId: img.id, file, width: img.width, height: img.height } : null
+        })
+        .filter((x): x is NonNullable<typeof x> => x != null)
+      const result = await saveScan(
+        { repos: layer.repos, blobStore: layer.blobStore },
+        { draft, images },
+      )
+      setSaveResult(result)
+      emitDataChanged('dish')
+      dispatch({ type: 'SAVE_SUCCESS' })
+    } catch (err) {
+      dispatch({ type: 'SAVE_FAILURE', message: err instanceof Error ? err.message : '保存失败' })
+    }
+  }, [draft])
 
   return (
     <div className="min-h-dvh bg-bg p-4 pb-24 text-ink">
@@ -87,6 +617,8 @@ export function Component() {
 
       {draft.phase !== 'confirm' && draft.phase !== 'saving' && draft.phase !== 'done' && (
         <section className="space-y-3">
+          {!draft.restaurantId && <RestaurantPicker onPicked={pickRestaurant} />}
+
           <label className="block cursor-pointer rounded-xl border border-dashed border-line bg-surface p-6 text-center text-sm">
             拍照 / 选择菜单图片（≤10 张，单张 ≤10MB）
             <input
@@ -97,6 +629,7 @@ export function Component() {
               onChange={(e) => onPickFiles(e.target.files)}
             />
           </label>
+          {rejectNotice && <p className="text-xs text-avoid">{rejectNotice}</p>}
           <ul className="grid grid-cols-3 gap-2">
             {draft.images.map((img) => (
               <li key={img.id} className="relative overflow-hidden rounded-lg border border-line">
@@ -106,10 +639,21 @@ export function Component() {
                   style={{ transform: `rotate(${img.rotation}deg)` }}
                   className="aspect-[3/4] w-full object-cover"
                 />
+                {(img.precheck.blur || img.precheck.glare || img.precheck.tooDark) && (
+                  <span className="absolute top-1 left-1 rounded bg-avoid/90 px-1 text-[10px] text-white">
+                    {[
+                      img.precheck.blur && '模糊',
+                      img.precheck.glare && '反光',
+                      img.precheck.tooDark && '过暗',
+                    ]
+                      .filter(Boolean)
+                      .join('/')}
+                  </span>
+                )}
                 <button
                   type="button"
                   className="absolute top-1 right-1 rounded bg-black/60 px-1 text-xs text-white"
-                  onClick={() => dispatch({ type: 'REMOVE_IMAGE', imageId: img.id })}
+                  onClick={() => removeImage(img.id)}
                 >
                   删除
                 </button>
@@ -123,94 +667,92 @@ export function Component() {
               </li>
             ))}
           </ul>
-          {draft.ocrError && (
-            <p className="text-sm text-avoid">
-              识别失败（{draft.ocrError.code}），可重试或改为手录。
+          {warnedImages.length > 0 && (
+            <p className="rounded-lg border border-avoid/40 bg-avoid/10 p-2 text-xs text-avoid">
+              {warnedImages.length}{' '}
+              张图片清晰度欠佳（模糊/反光/过暗），建议正对菜单、避免阴影后重拍；
+              也可继续识别，识别差的区域可框选重扫。
             </p>
+          )}
+          {draft.ocrError && (
+            <>
+              <p className="text-sm text-avoid">
+                识别失败（{draft.ocrError.code}），可重试或改为手录。
+              </p>
+              <Button
+                variant="secondary"
+                className="w-full"
+                onClick={() => dispatch({ type: 'ENTER_MANUAL' })}
+              >
+                改为手动录入
+              </Button>
+            </>
           )}
           <Button
             className="w-full"
-            disabled={draft.images.length === 0}
+            disabled={draft.images.length === 0 || draft.phase === 'ocr'}
             onClick={() => void onStartOcr()}
           >
-            开始识别
+            {draft.phase === 'ocr' ? '识别中…' : '开始识别'}
           </Button>
         </section>
       )}
 
       {(draft.phase === 'confirm' || draft.phase === 'saving') && (
         <section className="space-y-3">
+          {diffSummary && draft.isIncremental && (
+            <p className="rounded-lg border border-line bg-surface p-2 text-xs text-ink-muted">
+              与现有菜单相比：新增 {diffSummary.added} · 消失 {diffSummary.removed}（默认保留） ·
+              改名 {diffSummary.renamed}
+            </p>
+          )}
           {pending.length > 0 && (
             <p className="rounded-lg border border-avoid/40 bg-avoid/10 p-2 text-sm text-avoid">
               {pending.length} 行低置信（&lt;0.5）需逐行确认后才能保存。
             </p>
           )}
-          <ul className="space-y-2">
-            {draft.lines.map((line) => (
-              <li
-                key={line.lineKey}
-                className="rounded-lg border border-line bg-surface p-2 text-sm"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <input
-                    value={line.name}
-                    aria-label="菜名"
-                    className="min-w-0 flex-1 bg-transparent outline-none"
-                    onChange={(e) =>
-                      dispatch({
-                        type: 'EDIT_LINE',
-                        lineKey: line.lineKey,
-                        patch: { name: e.target.value },
-                      })
-                    }
-                  />
-                  <span className={lineTone(line)}>
-                    {line.confidence.toFixed(2)}
-                    {line.kind !== 'dish' ? ' · 其他' : ''}
-                  </span>
-                </div>
-                <div className="mt-1 flex items-center justify-between gap-2 text-xs text-ink-muted">
+          <RescanPanel
+            images={draft.images}
+            unreadable={draft.unreadable}
+            busy={rescanBusy}
+            error={rescanError}
+            onConfirm={(imageIndex, region) => void onRescanRegion(imageIndex, region)}
+          />
+          {groupMenuLines(draft.lines).map((group) => {
+            const isCollapsed = collapsedGroups.has(group.key)
+            return (
+              <div key={group.key} className="rounded-xl border border-line bg-surface">
+                <button
+                  type="button"
+                  aria-expanded={!isCollapsed}
+                  className="flex w-full items-center justify-between px-3 py-2 text-sm font-medium"
+                  onClick={() =>
+                    setCollapsedGroups((prev) => {
+                      const next = new Set(prev)
+                      if (next.has(group.key)) next.delete(group.key)
+                      else next.add(group.key)
+                      return next
+                    })
+                  }
+                >
                   <span>
-                    {line.section}
-                    {line.spec ? ` / ${line.spec}` : ''}
-                    {line.price != null ? ` / ¥${line.price}` : ''}
+                    {group.title}
+                    <span className="ml-2 text-xs font-normal text-ink-muted">
+                      {group.lines.length} 行
+                    </span>
                   </span>
-                  <span className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={() => dispatch({ type: 'DELETE_LINE', lineKey: line.lineKey })}
-                    >
-                      删除
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        dispatch({
-                          type: 'SET_DECISION',
-                          lineKey: line.lineKey,
-                          decision: 'keptSeparate',
-                        })
-                      }
-                    >
-                      保留
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        dispatch({
-                          type: 'SET_DECISION',
-                          lineKey: line.lineKey,
-                          decision: 'ignored',
-                        })
-                      }
-                    >
-                      忽略
-                    </button>
-                  </span>
-                </div>
-              </li>
-            ))}
-          </ul>
+                  <span className="text-xs text-ink-muted">{isCollapsed ? '展开' : '收起'}</span>
+                </button>
+                {!isCollapsed && (
+                  <ul className="space-y-2 border-t border-line p-2">
+                    {group.lines.map((line) => (
+                      <LineCard key={line.lineKey} line={line} dispatch={dispatch} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )
+          })}
           <Button
             variant="secondary"
             className="w-full"
@@ -218,6 +760,11 @@ export function Component() {
           >
             手动添加一行
           </Button>
+          {draft.saveError && (
+            <p className="rounded-lg border border-avoid/40 bg-avoid/10 p-2 text-sm text-avoid">
+              保存失败：{draft.saveError}（草稿已保留，可重试）
+            </p>
+          )}
           <div className="flex gap-2">
             <Button
               variant="ghost"
@@ -226,16 +773,12 @@ export function Component() {
             >
               返回重扫
             </Button>
-            {/* TODO(T3-05): START_SAVING 后调 workflow：DishRepo.upsertFromOcr(toResolvedItems(draft)) */}
             <Button
               className="flex-1"
-              disabled={!canConfirmSave(draft)}
-              onClick={() => {
-                dispatch({ type: 'START_SAVING' })
-                dispatch({ type: 'SAVE_SUCCESS' })
-              }}
+              disabled={!canConfirmSave(draft) || draft.lines.length === 0}
+              onClick={() => void onSave()}
             >
-              保存到图鉴
+              {draft.phase === 'saving' ? '保存中…' : '保存到图鉴'}
             </Button>
           </div>
         </section>
@@ -243,7 +786,13 @@ export function Component() {
 
       {draft.phase === 'done' && (
         <section className="space-y-4 text-center">
-          <p className="text-sm">已保存（prep harness：实际落库待 DishRepo 真实现）。</p>
+          <p className="text-sm">
+            已保存到图鉴
+            {saveResult
+              ? `：新建 ${saveResult.createdDishIds.length} · 关联 ${saveResult.linkedDishIds.length}`
+              : ''}
+            。
+          </p>
           <Button onClick={() => dispatch({ type: 'DISCARD' })}>再扫一次</Button>
         </section>
       )}

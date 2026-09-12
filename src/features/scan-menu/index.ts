@@ -16,6 +16,8 @@ export type {
 export { toBBox, bboxOverlapRatio, linesInRegion } from './lib/bbox'
 export { classifyMenuLine } from './lib/classify'
 export { normalizeSpec, mergeSpecPrices } from './lib/prices'
+export { groupMenuLines, OTHER_GROUP_TITLE, type LineGroup } from './lib/groupLines'
+export { cropRegionToDataUrl } from './lib/cropRegion'
 export {
   ACCEPTED_IMAGE_TYPES,
   MAX_IMAGE_BYTES,
@@ -37,7 +39,16 @@ export {
   type RenamedCandidate,
 } from './lib/diff'
 export { toLineDrafts } from './lib/respToLines'
+export { applyMatchResults, makeDishMatcher } from './lib/matchLines'
+export { analyzeImagePrecheck, type ImagePrecheckResult } from './lib/precheckRun'
 export { applyDefaultDecisions, resolvableLines, toResolvedItems } from './lib/save'
+export {
+  saveScan,
+  type SaveScanDeps,
+  type SaveScanImage,
+  type SaveScanInput,
+  type SaveScanResult,
+} from './workflow/saveScan'
 export {
   canConfirmSave,
   createInitialDraft,

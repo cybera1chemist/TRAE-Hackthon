@@ -3,7 +3,8 @@
  * 纯 reducer，无副作用；草稿全程驻留（退出恢复时用 RESTORE_DRAFT + isDraftFresh）。
  * 超时/失败语义：OCR 失败回 preview 可重试，完全失败可手录（T3-08）。
  */
-import type { ID, OcrUserDecision, ScanDiffSummary } from '@/domain/entities'
+import type { BBox, ID, OcrUserDecision, ScanDiffSummary } from '@/domain/entities'
+import { bboxOverlapRatio } from '../lib/bbox'
 import type {
   MenuLineDraft,
   ScanDraft,
@@ -23,6 +24,13 @@ export type ScanEvent =
   | { type: 'ADD_IMAGES'; slots: ScanImageSlot[] }
   | { type: 'REMOVE_IMAGE'; imageId: ID }
   | { type: 'ROTATE_IMAGE'; imageId: ID }
+  | {
+      type: 'UPDATE_PRECHECK'
+      imageId: ID
+      precheck: ScanImageSlot['precheck']
+      width?: number
+      height?: number
+    }
   | { type: 'START_OCR' }
   | {
       type: 'OCR_SUCCESS'
@@ -32,6 +40,7 @@ export type ScanEvent =
       diffSummary?: ScanDiffSummary
     }
   | { type: 'OCR_FAILURE'; error: ScanOcrError }
+  | { type: 'ENTER_MANUAL' }
   | {
       type: 'EDIT_LINE'
       lineKey: string
@@ -40,6 +49,15 @@ export type ScanEvent =
   | { type: 'SET_DECISION'; lineKey: string; decision: OcrUserDecision }
   | { type: 'DELETE_LINE'; lineKey: string }
   | { type: 'ADD_MANUAL_LINE'; section?: string }
+  | {
+      /** 框选重扫合并（EC-MENU-04）：同图 bbox 重叠（≥0.5）的行被 event.lines 替换 */
+      type: 'RESCAN_MERGE'
+      imageIndex: number
+      region: BBox
+      lines: MenuLineDraft[]
+      unreadable: UnreadableRegion[]
+      diffSummary?: ScanDiffSummary
+    }
   | { type: 'START_SAVING' }
   | { type: 'SAVE_SUCCESS' }
   | { type: 'SAVE_FAILURE'; message: string }
@@ -125,6 +143,29 @@ export function scanDraftReducer(state: ScanDraft, event: ScanEvent): ScanDraft 
       }
     }
 
+    case 'UPDATE_PRECHECK': {
+      if (state.phase !== 'upload' && state.phase !== 'preview') return state
+      return {
+        ...base,
+        images: state.images.map((img) =>
+          img.id === event.imageId
+            ? {
+                ...img,
+                precheck: event.precheck,
+                width: event.width ?? img.width,
+                height: event.height ?? img.height,
+              }
+            : img,
+        ),
+      }
+    }
+
+    case 'ENTER_MANUAL': {
+      // T3-08：OCR 完全失败降级手录——图片保留，直接进确认页手添行
+      if (state.phase !== 'preview' && state.phase !== 'upload') return state
+      return { ...base, phase: 'confirm' as const }
+    }
+
     case 'START_OCR': {
       if (state.images.length === 0) return state
       if (state.phase !== 'upload' && state.phase !== 'preview') return state
@@ -187,6 +228,31 @@ export function scanDraftReducer(state: ScanDraft, event: ScanEvent): ScanDraft 
         decision: 'keptSeparate', // 手动添加视为用户已决议（T3-05）
       }
       return { ...base, lines: [...state.lines, line] }
+    }
+
+    case 'RESCAN_MERGE': {
+      // EC-MENU-04：同图 bbox 重叠 ≥0.5 的旧行视为被重读，替换为重扫行；跨图行不受影响
+      if (state.phase !== 'confirm') return state
+      const hitsRegion = (bbox?: BBox) =>
+        bbox != null && bboxOverlapRatio(event.region, bbox) >= 0.5
+      const replacedKeys = new Set(
+        state.lines
+          .filter((l) => l.imageIndex === event.imageIndex && hitsRegion(l.bbox))
+          .map((l) => l.lineKey),
+      )
+      const unreadable = [
+        ...state.unreadable.filter(
+          (u) =>
+            !(u.imageIndex === event.imageIndex && bboxOverlapRatio(event.region, u.bbox) >= 0.5),
+        ),
+        ...event.unreadable.map((u) => ({ ...u, imageIndex: event.imageIndex })),
+      ]
+      return {
+        ...base,
+        lines: [...state.lines.filter((l) => !replacedKeys.has(l.lineKey)), ...event.lines],
+        unreadable,
+        diffSummary: event.diffSummary ?? state.diffSummary,
+      }
     }
 
     case 'START_SAVING': {

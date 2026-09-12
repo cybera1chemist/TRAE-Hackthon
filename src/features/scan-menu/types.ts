@@ -40,6 +40,9 @@ export interface ScanImageSlot {
   precheck: ImagePrecheck
   /** P1：手动旋转 90°（EC-MENU-02） */
   rotation: 0 | 90 | 180 | 270
+  /** 预检时读出的像素尺寸（Photo 登记用；解码失败时缺省） */
+  width?: number
+  height?: number
 }
 
 /** 确认页行分类（EC-MENU-04：酒水/茶位/餐具费归「其他」折叠区，不计入解锁统计） */
@@ -50,6 +53,8 @@ export interface MenuLineDraft {
   /** 本地行 id（未入库 = temp-xxx；已入库 = OcrItem.id） */
   lineKey: string
   ocrItemId?: ID
+  /** 来源图下标（与 draft.images 顺序一致；框选重扫按同图替换行，EC-MENU-04） */
+  imageIndex?: number
   section: string
   rawText: string
   name: string

@@ -21,6 +21,7 @@ export function toLineDrafts(resp: MenuScanResp): {
         const { kind } = classifyMenuLine(item.name, section.name)
         lines.push({
           lineKey: `temp-${image.imageIndex}-${si}-${ii}`,
+          imageIndex: image.imageIndex,
           section: section.name,
           rawText: item.name,
           name: item.name,

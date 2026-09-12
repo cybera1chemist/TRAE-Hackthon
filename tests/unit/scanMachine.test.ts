@@ -74,6 +74,18 @@ describe('scanDraftReducer 基本流转', () => {
     expect(retried.ocrError).toBeUndefined()
   })
 
+  it('ENTER_MANUAL：失败后降级手录，图片保留（T3-08）', () => {
+    const failed = run(createInitialDraft(), [
+      { type: 'ADD_IMAGES', slots: [slot('a')] },
+      { type: 'START_OCR' },
+      { type: 'OCR_FAILURE', error: { code: 'TIMEOUT', retriable: true } },
+    ])
+    const manual = run(failed, [{ type: 'ENTER_MANUAL' }])
+    expect(manual.phase).toBe('confirm')
+    expect(manual.images).toHaveLength(1)
+    expect(manual.lines).toHaveLength(0)
+  })
+
   it('saving → done；失败回 confirm 带 saveError', () => {
     const confirmed = run(createInitialDraft('r1'), [
       { type: 'ADD_IMAGES', slots: [slot('a')] },
@@ -150,5 +162,34 @@ describe('回退与草稿', () => {
     expect(next.phase).toBe('upload')
     expect(next.images).toHaveLength(0)
     expect(next.restaurantId).toBe('r1')
+  })
+
+  it('SELECT_RESTAURANT 仅在 upload/preview 有效；UPDATE_PRECHECK 就地更新（T3-01）', () => {
+    const picked = run(createInitialDraft(), [{ type: 'SELECT_RESTAURANT', restaurantId: 'r9' }])
+    expect(picked.restaurantId).toBe('r9')
+    // ocr 阶段不允许改店铺
+    const inOcr = run(picked, [{ type: 'ADD_IMAGES', slots: [slot('a')] }, { type: 'START_OCR' }])
+    expect(run(inOcr, [{ type: 'SELECT_RESTAURANT', restaurantId: 'r10' }]).restaurantId).toBe('r9')
+
+    const withImg = run(createInitialDraft(), [{ type: 'ADD_IMAGES', slots: [slot('a')] }])
+    const prechecked = run(withImg, [
+      {
+        type: 'UPDATE_PRECHECK',
+        imageId: 'a',
+        precheck: { blur: true, glare: false, tooDark: true },
+      },
+    ])
+    expect(prechecked.images[0].precheck).toEqual({ blur: true, glare: false, tooDark: true })
+    // 已删除的图不复活
+    const removed = run(prechecked, [{ type: 'REMOVE_IMAGE', imageId: 'a' }])
+    expect(
+      run(removed, [
+        {
+          type: 'UPDATE_PRECHECK',
+          imageId: 'a',
+          precheck: { blur: false, glare: false, tooDark: false },
+        },
+      ]).images,
+    ).toHaveLength(0)
   })
 })

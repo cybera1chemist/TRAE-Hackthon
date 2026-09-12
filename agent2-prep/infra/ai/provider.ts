@@ -78,7 +78,12 @@ export function normalizeError(e: unknown): AIError {
     return new AIError('NETWORK', `Network error: ${(e as Error).message}`)
   }
   // HTTP 响应错误：adapter 应抛带 status 的对象
-  if (e && typeof e === 'object' && 'status' in e && typeof (e as { status: unknown }).status === 'number') {
+  if (
+    e &&
+    typeof e === 'object' &&
+    'status' in e &&
+    typeof (e as { status: unknown }).status === 'number'
+  ) {
     const err = e as { status: number; body?: unknown; message?: string }
     const code = httpStatusToCode(err.status)
     return new AIError(code, err.message ?? `HTTP ${err.status}`, String(err.status))

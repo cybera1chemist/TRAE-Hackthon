@@ -108,7 +108,12 @@ export function createDevBffMiddleware(opts: DevBffOptions) {
     }
     if (bucket.count >= rateLimit) {
       res.writeHead(429, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'rate_limited', retryAfter: Math.ceil((bucket.resetAt - now) / 1000) }))
+      res.end(
+        JSON.stringify({
+          error: 'rate_limited',
+          retryAfter: Math.ceil((bucket.resetAt - now) / 1000),
+        }),
+      )
       return
     }
     bucket.count += 1
@@ -129,7 +134,12 @@ export function createDevBffMiddleware(opts: DevBffOptions) {
 
     if (!apiKey) {
       res.writeHead(503, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: 'dev_bff_no_key', message: 'AI_VENDOR_API_KEY missing in .env.local' }))
+      res.end(
+        JSON.stringify({
+          error: 'dev_bff_no_key',
+          message: 'AI_VENDOR_API_KEY missing in .env.local',
+        }),
+      )
       return
     }
 
@@ -198,7 +208,11 @@ interface UpstreamBody {
   temperature?: number
 }
 
-function buildUpstreamBody(endpoint: AiEndpoint, model: string, _body: string): UpstreamBody | null {
+function buildUpstreamBody(
+  endpoint: AiEndpoint,
+  model: string,
+  _body: string,
+): UpstreamBody | null {
   // v1.0 草稿：仅占位骨架。真实实现需要：
   //   - 解析 _body 拿到 images[] + context/dishName 等
   //   - 把图片 data URL 转成 OpenAI multimodal message 形态
@@ -207,7 +221,10 @@ function buildUpstreamBody(endpoint: AiEndpoint, model: string, _body: string): 
   return {
     model,
     messages: [
-      { role: 'system', content: `[TODO: inject ${endpoint} prompt from agent2-prep/infra/ai/prompts/]` },
+      {
+        role: 'system',
+        content: `[TODO: inject ${endpoint} prompt from agent2-prep/infra/ai/prompts/]`,
+      },
       { role: 'user', content: '[TODO: inject images + structured fields from request body]' },
     ],
     response_format: { type: 'json_object' },

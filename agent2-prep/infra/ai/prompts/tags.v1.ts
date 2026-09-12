@@ -84,11 +84,4 @@ export function buildUser(req: TagReq, vocab: VocabPayload): string {
 }
 
 /** 维度枚举导出，供 adapter 在做 tool/function schema 时复用 */
-export const TAG_DIMS: TagDim[] = [
-  'taste',
-  'cuisine',
-  'ingredient',
-  'cooking',
-  'scene',
-  'custom',
-]
+export const TAG_DIMS: TagDim[] = ['taste', 'cuisine', 'ingredient', 'cooking', 'scene', 'custom']

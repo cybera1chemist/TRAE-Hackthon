@@ -24,7 +24,8 @@ function createAppRouter(): Router {
     {
       errorElement: <RouteError />,
       children: [
-        { path: '/capture', lazy: () => import('./placeholders/capture') },
+        // T2-03~08：Agent-3 自助合入（片段见 src/pages/capture/route.ts），待 Agent-0 复核
+        { path: '/capture', lazy: () => import('@/pages/capture/CapturePage') },
         { path: '/scan/:rid?', lazy: () => import('./placeholders/scan') },
         { path: '/restaurant/:rid', lazy: () => import('./placeholders/restaurant') },
         { path: '/dish/:id', lazy: () => import('./placeholders/dish') },

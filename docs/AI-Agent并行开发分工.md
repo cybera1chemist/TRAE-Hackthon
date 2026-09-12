@@ -33,7 +33,7 @@ flowchart LR
 
 ## 2. 协作规则（所有 Agent 必须遵守）
 
-1. **分支**：各 agent 在自己分支工作：`feat/agent-0` … `feat/agent-6`，从 `zxc` 切出；完成后发 PR 合回 `zxc`，禁止互相直接改对方分支。
+1. **分支**：不使用 feature 分支，所有 agent 直接在 `zxc` 分支上提交改动；提交前先 `git pull --rebase` 同步远端，禁止 force push，禁止改写他人已推送的提交历史。
 2. **目录所有权（强约束，防冲突）**：只允许在自己名下目录写代码；需要改共享文件时走 §3 登记机制。
 
 | Agent | 独占目录 |
@@ -46,13 +46,13 @@ flowchart LR
 | Agent-5 | `src/pages/dex/`、`src/pages/restaurant/`、`src/pages/dish/`、`src/pages/insights/`、`src/features/dex-grid/`、`src/features/insights/`、`src/workers/stats.worker.ts` |
 | Agent-6 | `src/pages/card/`（如需要）、`src/features/share-card/`、`src/infra/card/`、`tests/e2e/` |
 
-3. **接口冻结点**：Agent-0 产出、Agent-1/2 在开工第 1 天必须冻结以下文件，之后只允许追加、不允许改签名（改动须在 PR 描述 @ 所有受影响 agent）：
+3. **接口冻结点**：Agent-0 产出、Agent-1/2 在开工第 1 天必须冻结以下文件，之后只允许追加、不允许改签名（改动须在提交说明中 @ 所有受影响 agent）：
    - `src/domain/entities/*.ts`（实体类型）
    - `src/infra/db/repositories.ts`（Repository 接口签名）
    - `src/infra/ai/types.ts`（AIProvider 接口与 DTO）
    - `src/ui/index.ts`（DS 组件导出清单）
 4. **共享文件只由 Owner 改**：路由表（Agent-0 维护，各 agent 提交路由片段给 Agent-0 合并）、导航栏（Agent-0）、全局样式与主题变量（Agent-0）。
-5. **自测**：领域纯函数必须带 Vitest 单测；页面功能自测通过再提 PR；E2E 由 Agent-6 统一编写。
+5. **自测**：领域纯函数必须带 Vitest 单测；页面功能自测通过再提交；E2E 由 Agent-6 统一编写。
 6. **提交**：commit 带任务 ID（如 `feat(T2-03): ...`）；不提无关重构；不格式化别人目录的文件。
 7. **Mock 优先**：批次 3 的 agent 一律通过 Agent-2 的 Mock adapter 开发，不等真实模型。
 
@@ -76,7 +76,7 @@ flowchart LR
 **先读**：TDD §2.3/§2.4/§9。
 **做什么**：
 1. Vite+React18+TS(strict)+Tailwind+Router(v6 lazy)+Zustand+TanStack Query+Dexie 工程，按 TDD §2.4 建全部空目录；
-2. lint/prettier/husky/lint-staged；GitHub Actions（lint→typecheck→test→build→playwright）+ PR 预览部署；
+2. lint/prettier/husky/lint-staged；GitHub Actions（lint→typecheck→test→build→playwright），push 到 zxc 触发；
 3. Vitest/Testing Library/Playwright 双视口脚手架；
 4. `src/ui/` DS：Button/Input/Textarea/Sheet/Dialog/Chip/Empty/Toast/Stars（半星）/Switch/LoadingButton，主题变量含图鉴配色与暗色；
 5. App 壳：底部导航 4 Tab、路由占位、ErrorBoundary、Web Font 方案；
@@ -159,11 +159,11 @@ flowchart LR
 6. 生产部署、BFF 密钥、冒烟与回滚预案。
 **验收**：七条准入 E2E 全绿；三模板 × 有图/无图/避雷截图回归通过；Lighthouse 移动 ≥85。
 
-## 5. 集成顺序（合入 zxc 的门禁）
+## 5. 集成顺序（提交到 zxc 的门禁）
 
-1. Agent-0 先合；Agent-1、Agent-2 rebase 后并行开发；
-2. Agent-1（含内存假实现替换为真实 DB）、Agent-2（Mock + BFF）合入后，批次 3 开工；
-3. 批次 3 四个 agent 各自 PR，合入顺序建议：Agent-5（纯视图）→ Agent-3（主链路）→ Agent-4 → Agent-6；每次合入由 Agent-6 跑一次全量 E2E 回归；
+1. Agent-0 基建已直接提交在 `zxc`；Agent-1、Agent-2 基于最新 `zxc` 并行开发；
+2. Agent-1（含内存假实现替换为真实 DB）、Agent-2（Mock + BFF）提交后，批次 3 开工；
+3. 批次 3 四个 agent 直接向 `zxc` 提交，建议顺序：Agent-5（纯视图）→ Agent-3（主链路）→ Agent-4 → Agent-6；每轮合入由 Agent-6 跑一次全量 E2E 回归；
 4. 冲突仲裁：目录归属冲突以 §2 表为准；契约签名冲突由 Agent-0 + Agent-1 裁定；需求歧义查 PRD，仍不明暂停并问产品，不得自行扩需求。
 
 ## 6. 给每个 Agent 的统一启动提示词（复制即用）
@@ -173,7 +173,7 @@ flowchart LR
 PRD、技术设计文档、开发任务清单、AI-Agent并行开发分工。请先全部阅读，
 然后严格按分工文档中 Agent-{n} 的任务卡执行：
 - 只在分配给你的目录写代码，遵守目录所有权与接口冻结规则；
-- 分支 feat/agent-{n}，commit 带任务 ID；
+- 直接在 `zxc` 分支提交，commit 带任务 ID，提交前先 `git pull --rebase`；
 - 依赖其他 agent 的交付物时，只调用 §3 表中的接口，接口缺失或不符则暂停并反馈，不要自行改别人的文件；
-- 完成任务卡的全部验收标准后，提 PR 到 zxc，并在 PR 描述列出已完成任务 ID 与自测结果。
+- 完成任务卡的全部验收标准后，将改动直接提交到 zxc 分支，并在提交说明中列出已完成任务 ID 与自测结果。
 ```

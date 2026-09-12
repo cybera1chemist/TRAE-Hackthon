@@ -11,6 +11,7 @@ import { ToastProvider } from '@/ui'
 import { Component as DexPage } from '@/pages/dex/DexPage'
 import { Component as RestaurantPage } from '@/pages/restaurant/RestaurantPage'
 import { Component as DishPage } from '@/pages/dish/DishPage'
+import { Component as InsightsPage } from '@/pages/insights/InsightsPage'
 import { initDataLayerForTest, resetDataLayerForTest } from '@/application/data/dataLayer'
 import { useAvoidDishWarning } from '@/application/data/queries'
 import type { DataLayer } from '@/infra/db'
@@ -282,5 +283,26 @@ describe('Agent-5 页面集成（内存数据层）', () => {
 
     rerender({ name: '麻婆豆腐', rid: ids.r1 })
     await waitFor(() => expect(result.current.matches).toHaveLength(1))
+  })
+
+  it('T4-02 打卡不足 5 次：总览卡显示真实 0，图表位给解锁提示而非示例数据（EC-INS-01）', async () => {
+    resetDataLayerForTest()
+    await initDataLayerForTest({ force: 'memory', requestPersistence: false })
+    renderRoute('/', <InsightsPage />)
+
+    // 总览四张卡都是真实的 0（示例数据的 9/8/2/3 不允许出现）
+    await waitFor(() => expect(screen.getAllByText('0').length).toBeGreaterThanOrEqual(4))
+    expect(screen.queryByText('9')).not.toBeInTheDocument()
+    expect(screen.queryByText('8')).not.toBeInTheDocument()
+
+    // 口味画像、菜系分布两处均为解锁提示，不渲染图表
+    const hints = screen.getAllByText('再打卡 5 次即可解锁')
+    expect(hints).toHaveLength(2)
+    expect(screen.queryByText('标签云')).not.toBeInTheDocument()
+    expect(screen.queryByText('环形图')).not.toBeInTheDocument()
+
+    // 避雷库未解锁不渲染；底部旧的「专属洞察未解锁」整块已移除
+    expect(screen.queryByText('避雷库')).not.toBeInTheDocument()
+    expect(screen.queryByText('专属洞察未解锁')).not.toBeInTheDocument()
   })
 })

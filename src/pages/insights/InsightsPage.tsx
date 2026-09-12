@@ -1,15 +1,21 @@
 import { useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { CalendarDays, Flame, Info, Sparkles, Store, ShieldAlert, Utensils } from 'lucide-react'
+import {
+  CalendarDays,
+  Flame,
+  Info,
+  LockKeyhole,
+  Sparkles,
+  Store,
+  ShieldAlert,
+  Utensils,
+} from 'lucide-react'
 import { useDataBridge, useRestaurants, useSetAvoid } from '@/application/data/queries'
 import { emitDataChanged } from '@/application/data/dataBus'
 import { getDataLayer } from '@/application/data/dataLayer'
-import { Button, Empty, LoadingButton, useToast, cn } from '@/ui'
+import { Button, LoadingButton, useToast, cn } from '@/ui'
 import { useInsightsStats } from '@/features/insights/stats/useInsightsStats'
-import { computeInsights } from '@/features/insights/stats/computeStats'
-import { buildDemoDataset } from '@/features/insights/stats/fixtures'
 import { tasteColor } from '@/features/insights/stats/semanticColors'
-import type { InsightsStats } from '@/features/insights/stats/types'
 import type { BackfillProgress } from '@/infra/ai/backfill/types'
 import { createBackfillDataPort } from '@/application/ai/backfillDataPort'
 import { PersistenceBanner } from '@/features/dex-grid/PersistenceBanner'
@@ -71,6 +77,17 @@ function EmptyChart({ text }: { text: string }) {
   )
 }
 
+/** 打卡数未达解锁阈值时的图表位提示（EC-INS-01：不展示示例数据，避免误解） */
+function LockedChart({ remaining }: { remaining: number }) {
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-1.5 text-center">
+      <LockKeyhole className="h-7 w-7 text-ink-muted opacity-50" />
+      <p className="text-sm font-medium text-ink">再打卡 {remaining} 次即可解锁</p>
+      <p className="text-xs text-ink-muted">积累更多打卡后，这里会生成你的专属图表</p>
+    </div>
+  )
+}
+
 export function Component() {
   useDataBridge()
   const navigate = useNavigate()
@@ -89,15 +106,10 @@ export function Component() {
     return m
   }, [restaurantsQuery.data])
 
-  // 预览模式：<5 条打卡时用夹具数据展示图表骨架（EC-INS-01，明确标注示例数据）
+  // EC-INS-01：打卡数不足阈值时，总览卡显示真实数据（含 0），图表位只给解锁提示，不展示示例数据
   const realTotal = stats?.overview.totalLogs ?? 0
-  const preview: InsightsStats | null = useMemo(() => {
-    if (!stats || realTotal >= INSIGHTS_MIN_LOGS) return null
-    const demo = buildDemoDataset()
-    return computeInsights({ logs: demo.logs, dishes: demo.dishes, now: demo.now })
-  }, [stats, realTotal])
-
-  const shown = preview ?? stats
+  const locked = realTotal < INSIGHTS_MIN_LOGS
+  const remainingToUnlock = Math.max(0, INSIGHTS_MIN_LOGS - realTotal)
 
   const runBackfill = async () => {
     if (backfill) return
@@ -139,19 +151,19 @@ export function Component() {
     }
   }
 
-  if (!shown) {
+  if (!stats) {
     return <div className="py-24 text-center text-sm text-ink-muted">加载洞察中…</div>
   }
 
-  const ov = shown.overview
-  const tasteItems = shown.taste.map((p) => ({ ...p, color: tasteColor(p.value) }))
-  const cuisineItems = shown.cuisine.map((p, i) => ({
+  const ov = stats.overview
+  const tasteItems = stats.taste.map((p) => ({ ...p, color: tasteColor(p.value) }))
+  const cuisineItems = stats.cuisine.map((p, i) => ({
     ...p,
     color: CUISINE_PALETTE[i % CUISINE_PALETTE.length],
   }))
   const noTagsAtAll =
-    shown.windowLogCount > 0 && shown.taste.length === 0 && shown.cuisine.length === 0
-  const avoidGroups = Object.entries(shown.avoidGroups)
+    stats.windowLogCount > 0 && stats.taste.length === 0 && stats.cuisine.length === 0
+  const avoidGroups = Object.entries(stats.avoidGroups)
 
   const undoAvoid = async (dishId: string, name: string) => {
     await setAvoid.mutateAsync({ dishId, avoid: false })
@@ -174,11 +186,10 @@ export function Component() {
         )}
       </header>
 
-      {preview && (
+      {locked && (
         <div className="rounded-card border border-gold/60 bg-gold/10 px-4 py-3 text-xs leading-relaxed text-ink">
-          已有 {realTotal} 次打卡，再打卡 <b>{Math.max(0, INSIGHTS_MIN_LOGS - realTotal)}</b>{' '}
-          次即可解锁专属美食洞察。 下方图表为
-          <span className="font-semibold"> 预览样式（示例数据）</span>。
+          已有 {realTotal} 次打卡，再打卡 <b>{remainingToUnlock}</b>{' '}
+          次即可解锁口味画像、菜系分布与避雷库。
         </div>
       )}
 
@@ -206,12 +217,12 @@ export function Component() {
         />
       </div>
 
-      {/* 口味：云图 / 环形切换 */}
+      {/* 口味：云图 / 环形切换；未解锁时只显示解锁提示 */}
       <Card
         title="口味画像"
         caption="统计近 365 个自然日内的口味标签，同维度内归一为 100%；点击可下钻到图鉴。"
         action={
-          !preview && shown.taste.length > 0 ? (
+          !locked && stats.taste.length > 0 ? (
             <div className="flex rounded-full border border-line p-0.5 text-xs">
               {(['cloud', 'donut'] as const).map((tab) => (
                 <button
@@ -230,50 +241,46 @@ export function Component() {
           ) : null
         }
       >
-        {shown.taste.length === 0 ? (
-          <EmptyChart text={preview ? '示例数据无口味标签' : '近 365 天还没有口味标签'} />
+        {locked ? (
+          <LockedChart remaining={remainingToUnlock} />
+        ) : stats.taste.length === 0 ? (
+          <EmptyChart text="近 365 天还没有口味标签" />
         ) : chartTab === 'cloud' ? (
           <TagCloudChart
-            tags={shown.topTags}
+            tags={stats.topTags}
             caption="口味标签出现次数 · 近 365 天"
-            onTagClick={
-              preview ? undefined : (v) => navigate(`/dex?view=tag&t=${encodeURIComponent(v)}`)
-            }
+            onTagClick={(v) => navigate(`/dex?view=tag&t=${encodeURIComponent(v)}`)}
           />
         ) : (
           <DonutChart
             items={tasteItems}
             caption="口味标签 · 近 365 天 · 维度内归一"
             centerLabel="打卡数"
-            onItemClick={
-              preview ? undefined : (v) => navigate(`/dex?view=tag&t=${encodeURIComponent(v)}`)
-            }
+            onItemClick={(v) => navigate(`/dex?view=tag&t=${encodeURIComponent(v)}`)}
           />
         )}
       </Card>
 
-      {/* 菜系环形图（口径独立） */}
+      {/* 菜系环形图（口径独立）；未解锁时只显示解锁提示 */}
       <Card
         title="菜系分布"
         caption="每道菜只取第一个菜系标签（cuisine.primary），分母为近 365 天已分类打卡数；无菜系标签的打卡不计入占比。"
       >
-        {shown.cuisine.length === 0 ? (
-          <EmptyChart text={preview ? '示例数据无菜系标签' : '近 365 天还没有菜系标签'} />
+        {locked ? (
+          <LockedChart remaining={remainingToUnlock} />
+        ) : stats.cuisine.length === 0 ? (
+          <EmptyChart text="近 365 天还没有菜系标签" />
         ) : (
           <>
             <DonutChart
               items={cuisineItems}
               caption="主菜系 · 近 365 天 · 分母为已分类打卡"
               centerLabel="已分类"
-              onItemClick={
-                preview
-                  ? undefined
-                  : (v) => navigate(`/dex?view=cuisine&g=${encodeURIComponent(v)}`)
-              }
+              onItemClick={(v) => navigate(`/dex?view=cuisine&g=${encodeURIComponent(v)}`)}
             />
-            {shown.unclassifiedCuisineCount > 0 && (
+            {stats.unclassifiedCuisineCount > 0 && (
               <p className="text-center text-xs text-ink-muted">
-                另有 {shown.unclassifiedCuisineCount} 条打卡无菜系标签，未计入占比
+                另有 {stats.unclassifiedCuisineCount} 条打卡无菜系标签，未计入占比
               </p>
             )}
           </>
@@ -281,7 +288,7 @@ export function Component() {
       </Card>
 
       {/* EC-INS-02：全量无标签时的一键补全 CTA */}
-      {!preview && noTagsAtAll && (
+      {!locked && noTagsAtAll && (
         <div className="rounded-card border border-dashed border-primary/60 bg-primary/5 p-4 text-center">
           <Sparkles className="mx-auto h-6 w-6 text-primary" />
           <p className="mt-2 text-sm font-medium text-ink">让 AI 补全历史打卡标签</p>
@@ -320,8 +327,8 @@ export function Component() {
         </div>
       )}
 
-      {/* 避雷库（T4-03：按店分组、短评、撤销即时生效；预览态仅展示示例图表，不渲染可交互列表） */}
-      {!preview && (
+      {/* 避雷库（T4-03：按店分组、短评、撤销即时生效；未达解锁阈值时不渲染） */}
+      {!locked && (
         <Card
           title="避雷库"
           caption="手动标记或评分 ≤2 的菜品自动进入避雷库，会在店铺横幅、搜索与打卡前提醒中联动提示。"
@@ -391,14 +398,6 @@ export function Component() {
             </div>
           )}
         </Card>
-      )}
-
-      {preview && (
-        <Empty
-          icon={<Sparkles className="h-10 w-10" />}
-          title="专属洞察未解锁"
-          description={`再完成 ${Math.max(0, INSIGHTS_MIN_LOGS - realTotal)} 次打卡，即可生成你的口味画像、菜系分布与避雷库。`}
-        />
       )}
     </div>
   )

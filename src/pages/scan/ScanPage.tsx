@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type Dispatch } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type Dispatch } from 'react'
 import { useParams } from 'react-router-dom'
 import { Button } from '@/ui'
 import { createAIProvider, type AIErrorCode } from '@/infra/ai'
 import { getDataLayer } from '@/application/data/dataLayer'
 import { emitDataChanged } from '@/application/data/dataBus'
-import type { BBox, Dish, Restaurant } from '@/domain/entities'
+import type { BBox, Dish, MenuScan, Restaurant } from '@/domain/entities'
 import {
   analyzeImagePrecheck,
   applyMatchResults,
@@ -20,6 +20,7 @@ import {
   scanDraftReducer,
   toLineDrafts,
   validateImageFiles,
+  type MenuDiff,
   type MenuLineDraft,
   type ScanEvent,
   type ScanImageSlot,
@@ -35,6 +36,8 @@ import {
  *   并用 computeMenuDiff 出增量摘要（EC-MENU-05，仅确认差异）；
  * - 确认页（T3-03）：分区折叠 + 其他区（酒水/茶位）默认折叠（EC-MENU-04）、菜名/价格行内编辑、
  *   不可读区块框选重扫（RESCAN_MERGE 替换重叠行）、手添行、低置信（<0.5）决议门禁；
+ * - 增量确认（T3-06）：实时 diff 差异卡，消失菜默认保留、勾选才删除（EC-MENU-05），
+ *   改名候选仅提示、user 菜名不覆盖（EC-MENU-06）；上传页展示扫描历史；
  * - 保存落库走 saveScan workflow（upsertFromOcr + BlobStore）。
  */
 
@@ -334,6 +337,103 @@ function RescanPanel({
   )
 }
 
+/** 扫描历史（T3-06 / EC-MENU-05）：选中店铺后展示历史扫描记录，预告增量模式 */
+function ScanHistory({ restaurantId }: { restaurantId: string }) {
+  const [scans, setScans] = useState<MenuScan[] | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    void getDataLayer()
+      .then((layer) => layer.repos.menuScans.listByRestaurant(restaurantId))
+      .then((rows) => {
+        if (alive) setScans(rows)
+      })
+      .catch(() => {
+        if (alive) setScans([])
+      })
+    return () => {
+      alive = false
+    }
+  }, [restaurantId])
+
+  if (scans == null || scans.length === 0) return null
+  const recent = [...scans]
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+    .slice(0, 5)
+
+  return (
+    <div className="space-y-1 rounded-xl border border-line bg-surface p-3">
+      <p className="text-sm font-medium">扫描历史</p>
+      <ul className="space-y-1 text-xs text-ink-muted">
+        {recent.map((s) => (
+          <li key={s.id}>
+            {new Date(s.createdAt).toLocaleString('zh-CN', { hour12: false })} ·{' '}
+            {s.isIncremental ? '增量' : '首扫'} ·{' '}
+            {s.status === 'confirmed' ? '已确认' : s.status === 'discarded' ? '已放弃' : '未完成'}
+            {s.diffSummary
+              ? ` · 新增${s.diffSummary.added}/消失${s.diffSummary.removed}/改名${s.diffSummary.renamed}`
+              : ''}
+          </li>
+        ))}
+      </ul>
+      <p className="text-xs text-gold">再次扫描将进入增量模式：只确认差异，旧菜默认保留。</p>
+    </div>
+  )
+}
+
+/** 增量差异确认卡（T3-06 / EC-MENU-05/06）：仅确认差异；旧菜默认保留，勾选才删除 */
+function DiffConfirmCard({
+  diff,
+  removedConfirm,
+  onToggleRemoved,
+}: {
+  diff: MenuDiff
+  removedConfirm: Set<string>
+  onToggleRemoved: (dishId: string) => void
+}) {
+  const { summary, removed, renamed } = diff
+  if (summary.added === 0 && summary.removed === 0 && summary.renamed === 0) {
+    return (
+      <p className="rounded-lg border border-line bg-surface p-2 text-xs text-ink-muted">
+        与现有菜单一致，无差异。
+      </p>
+    )
+  }
+  return (
+    <div className="space-y-2 rounded-lg border border-line bg-surface p-2 text-xs">
+      <p className="text-ink-muted">
+        增量模式：新增 {summary.added} · 消失 {summary.removed}（默认保留） · 改名 {summary.renamed}
+      </p>
+      {removed.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-ink-muted">本次扫描未出现的现存菜：</p>
+          <ul className="space-y-1">
+            {removed.map((d) => (
+              <li key={d.id} className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate">{d.name}</span>
+                <label className="flex shrink-0 items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={removedConfirm.has(d.id)}
+                    onChange={() => onToggleRemoved(d.id)}
+                  />
+                  确认已下架并删除
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {renamed.length > 0 && (
+        <p className="text-ink-muted">
+          可能改名：{renamed.map((r) => `${r.dish.name} → ${r.suggestedName}`).join('；')}。
+          在上方对应行选「合并到相似菜」即可生效；人工改过的菜名不会被 AI 覆盖（EC-MENU-06）。
+        </p>
+      )}
+    </div>
+  )
+}
+
 /** 店铺选择/新建（T3-01）：联想搜索 + 无结果时新建；选中后写入草稿（不动 URL，避免重挂载丢草稿） */
 function RestaurantPicker({ onPicked }: { onPicked: (id: string) => void }) {
   const [kw, setKw] = useState('')
@@ -421,6 +521,13 @@ export function Component() {
   const [rescanBusy, setRescanBusy] = useState(false)
   const [rescanError, setRescanError] = useState<string | null>(null)
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set(['other']))
+  // 增量确认（T3-06 / EC-MENU-05）：消失菜默认保留，勾选确认后才随保存删除
+  const [removedConfirm, setRemovedConfirm] = useState<Set<string>>(() => new Set())
+  /** 实时差异（随行编辑重算）；existingRef 在 OCR 时填充 */
+  const liveDiff = useMemo(
+    () => computeMenuDiff(draft.lines, existingRef.current, makeDishMatcher()),
+    [draft.lines],
+  )
 
   const onPickFiles = useCallback(
     (files: FileList | null) => {
@@ -486,6 +593,7 @@ export function Component() {
       .filter((f): f is File => f != null)
     if (files.length === 0) return
     dispatch({ type: 'START_OCR' })
+    setRemovedConfirm(new Set())
     try {
       const [layer, images] = await Promise.all([
         getDataLayer(),
@@ -577,13 +685,13 @@ export function Component() {
   )
 
   const pending = pendingLowConfidence(draft)
-  const diffSummary = draft.diffSummary
   const [saveResult, setSaveResult] = useState<SaveScanResult | null>(null)
   const warnedImages = draft.images.filter(
     (img) => img.precheck.blur || img.precheck.glare || img.precheck.tooDark,
   )
 
-  /** 保存落库（T3-05/08 workflow）：失败 SAVE_FAILURE 回 confirm，草稿不丢 */
+  /** 保存落库（T3-05/08 workflow）：失败 SAVE_FAILURE 回 confirm，草稿不丢；
+   *  勾选删除的消失菜与当前 diff.removed 求交（编辑决议后可能重新匹配上，防止误删） */
   const onSave = useCallback(async () => {
     dispatch({ type: 'START_SAVING' })
     try {
@@ -594,9 +702,12 @@ export function Component() {
           return file ? { imageId: img.id, file, width: img.width, height: img.height } : null
         })
         .filter((x): x is NonNullable<typeof x> => x != null)
+      const confirmedRemovedDishIds = [...removedConfirm].filter((id) =>
+        liveDiff.removed.some((d) => d.id === id),
+      )
       const result = await saveScan(
         { repos: layer.repos, blobStore: layer.blobStore },
-        { draft, images },
+        { draft, images, confirmedRemovedDishIds },
       )
       setSaveResult(result)
       emitDataChanged('dish')
@@ -604,7 +715,7 @@ export function Component() {
     } catch (err) {
       dispatch({ type: 'SAVE_FAILURE', message: err instanceof Error ? err.message : '保存失败' })
     }
-  }, [draft])
+  }, [draft, removedConfirm, liveDiff])
 
   return (
     <div className="min-h-dvh bg-bg p-4 pb-24 text-ink">
@@ -618,6 +729,7 @@ export function Component() {
       {draft.phase !== 'confirm' && draft.phase !== 'saving' && draft.phase !== 'done' && (
         <section className="space-y-3">
           {!draft.restaurantId && <RestaurantPicker onPicked={pickRestaurant} />}
+          {draft.restaurantId && <ScanHistory restaurantId={draft.restaurantId} />}
 
           <label className="block cursor-pointer rounded-xl border border-dashed border-line bg-surface p-6 text-center text-sm">
             拍照 / 选择菜单图片（≤10 张，单张 ≤10MB）
@@ -700,11 +812,19 @@ export function Component() {
 
       {(draft.phase === 'confirm' || draft.phase === 'saving') && (
         <section className="space-y-3">
-          {diffSummary && draft.isIncremental && (
-            <p className="rounded-lg border border-line bg-surface p-2 text-xs text-ink-muted">
-              与现有菜单相比：新增 {diffSummary.added} · 消失 {diffSummary.removed}（默认保留） ·
-              改名 {diffSummary.renamed}
-            </p>
+          {draft.isIncremental && liveDiff && (
+            <DiffConfirmCard
+              diff={liveDiff}
+              removedConfirm={removedConfirm}
+              onToggleRemoved={(dishId) =>
+                setRemovedConfirm((prev) => {
+                  const next = new Set(prev)
+                  if (next.has(dishId)) next.delete(dishId)
+                  else next.add(dishId)
+                  return next
+                })
+              }
+            />
           )}
           {pending.length > 0 && (
             <p className="rounded-lg border border-avoid/40 bg-avoid/10 p-2 text-sm text-avoid">
@@ -793,7 +913,14 @@ export function Component() {
               : ''}
             。
           </p>
-          <Button onClick={() => dispatch({ type: 'DISCARD' })}>再扫一次</Button>
+          <Button
+            onClick={() => {
+              setRemovedConfirm(new Set())
+              dispatch({ type: 'DISCARD' })
+            }}
+          >
+            再扫一次
+          </Button>
         </section>
       )}
     </div>

@@ -1,28 +1,17 @@
 /**
- * FoodDex · AIProviderRouter 路由骨架（Agent-2 准备区草稿）
- *
- * 对应任务：T0-06（router 部分）/ T2-01
- * 对应接口：AIProvider (src/infra/ai/types.ts，Agent-0 已冻结)
- *
- * 职责（TDD §5.1）：
- *   circuitBreaker → retry → timeout(AbortController) → adapter
- *
- * v1.0 简化策略：
- *   - circuitBreaker 暂以"连续失败计数 + 30s 冷却"实现，不引第三方库
- *   - retry：仅 NETWORK/TIMEOUT/RATE_LIMITED（由契约 RETRIABLE_CODES 决定），
- *     最多 1 次，抖动退避 800–1600ms（PRD 6.2 不允许多次）
- *   - timeout：使用契约 AI_TIMEOUT_MS（recognize 15s / menuScan 20s / tags 10s / cardCopy 10s）
- *   - 错误归一化：所有原生错误转 AIError(code, message?, vendorCode?)
- *
- * ⚠️ 这是骨架草稿。真实供应商 Adapter（QwenAdapter/DoubaoAdapter）由
- * adapters/ 目录单独实现，本文件只负责编排与归一化。
- * 正式工程位置：src/infra/ai/provider.ts（Agent-2 名下目录）。
+ * AIProviderRouter（T0-06 实现 / T2-01）。
+ * 编排链（TDD §5.1）：circuitBreaker → retry(1) → timeout(AbortController) → adapter。
+ * - 超时阈值取冻结契约 AI_TIMEOUT_MS；
+ * - 仅 RETRIABLE_CODES（NETWORK/TIMEOUT/RATE_LIMITED）自动重试 1 次，抖动退避；
+ *   识别类不多次重试（PRD §6.2）；
+ * - 所有原生错误经 normalizeError 归一为 AIError，业务层不感知供应商差异；
+ * - 熔断：连续失败 N 次后冷却期内短路，避免弱网/欠费时持续打爆供应商。
  */
-
 import {
   AIError,
   AI_TIMEOUT_MS,
   RETRIABLE_CODES,
+  type AIErrorCode,
   type AIProvider,
   type CopyReq,
   type CopyResp,
@@ -32,9 +21,7 @@ import {
   type RecognizeResp,
   type TagReq,
   type TagResp,
-} from '@/infra/ai/types'
-
-// ─── 超时配置：直接使用契约 AI_TIMEOUT_MS ──────────────────────────
+} from './types'
 
 type Endpoint = keyof AIProvider
 
@@ -43,7 +30,7 @@ const timeoutFor = (endpoint: Endpoint): number => {
     case 'recognizeDish':
       return AI_TIMEOUT_MS.recognize
     case 'scanMenu':
-      // 注：契约为静态 20s；若需按图片数伸缩，需提 issue 给 Agent-0 改契约
+      // 冻结契约为单张 20s；多图总时长由 BFF/adapter 内部按图串行控制
       return AI_TIMEOUT_MS.menuScan
     case 'extractTags':
       return AI_TIMEOUT_MS.tags
@@ -52,7 +39,7 @@ const timeoutFor = (endpoint: Endpoint): number => {
   }
 }
 
-// ─── 错误归一化（对齐 Agent-0 的 AIError 三参构造）────────────────
+// ── 错误归一化 ────────────────────────────────────────────────────────────────
 
 const isAbortError = (e: unknown): boolean =>
   (e instanceof DOMException && (e.name === 'TimeoutError' || e.name === 'AbortError')) ||
@@ -61,14 +48,30 @@ const isAbortError = (e: unknown): boolean =>
 const isNetworkError = (e: unknown): boolean =>
   e instanceof TypeError || (e instanceof Error && /network|fetch failed|ECONN/i.test(e.message))
 
-const httpStatusToCode = (status: number): AIError['code'] => {
+const httpStatusToCode = (status: number): AIErrorCode => {
   if (status === 401 || status === 403) return 'AUTH'
   if (status === 429) return 'RATE_LIMITED'
-  if (status >= 500) return 'NETWORK' // 5xx 视为可重试网络问题
+  if (status >= 500) return 'NETWORK' // 5xx 视为可重试的上游故障
   return 'UNKNOWN'
 }
 
-/** 将任意错误归一为 AIError；若已是 AIError 则原样返回 */
+/** adapter 可抛出携带 HTTP status 的错误，由本函数识别 */
+export interface HttpLikeError {
+  status: number
+  message?: string
+  body?: unknown
+}
+
+const isHttpLikeError = (e: unknown): e is HttpLikeError =>
+  !!e &&
+  typeof e === 'object' &&
+  'status' in e &&
+  typeof (e as { status: unknown }).status === 'number'
+
+/**
+ * 将任意错误归一为 AIError。已是 AIError 原样返回（保留 adapter 已标注的语义）。
+ * zod 校验失败（name==='ZodError'）归一为 BAD_OUTPUT。
+ */
 export function normalizeError(e: unknown): AIError {
   if (e instanceof AIError) return e
   if (isAbortError(e)) {
@@ -77,31 +80,27 @@ export function normalizeError(e: unknown): AIError {
   if (isNetworkError(e)) {
     return new AIError('NETWORK', `Network error: ${(e as Error).message}`)
   }
-  // HTTP 响应错误：adapter 应抛带 status 的对象
-  if (
-    e &&
-    typeof e === 'object' &&
-    'status' in e &&
-    typeof (e as { status: unknown }).status === 'number'
-  ) {
-    const err = e as { status: number; body?: unknown; message?: string }
-    const code = httpStatusToCode(err.status)
-    return new AIError(code, err.message ?? `HTTP ${err.status}`, String(err.status))
+  if (isHttpLikeError(e)) {
+    const code = httpStatusToCode(e.status)
+    return new AIError(code, e.message ?? `HTTP ${e.status}`, String(e.status))
   }
-  // zod 校验失败：adapter 在解析阶段抛 ZodError
   if (e && typeof e === 'object' && 'name' in e && (e as { name: string }).name === 'ZodError') {
     return new AIError('BAD_OUTPUT', 'AI response failed schema validation')
   }
   return new AIError('UNKNOWN', (e as Error)?.message ?? 'Unknown AI error')
 }
 
-// ─── 超时 + 用户取消 ───────────────────────────────────────────────
+// ── 超时 + 用户取消 ──────────────────────────────────────────────────────────
 
 async function withTimeout<T>(
   fn: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,
   outerSignal?: AbortSignal,
 ): Promise<T> {
+  // 调用方传入的信号已中止：不创建定时器、不调用 adapter，快速失败（重试第二轮也走这里）
+  if (outerSignal?.aborted) {
+    throw new DOMException('aborted by user', 'AbortError')
+  }
   const ctrl = new AbortController()
   const timer = setTimeout(() => {
     if (!ctrl.signal.aborted) ctrl.abort(new DOMException('AI timeout', 'TimeoutError'))
@@ -126,7 +125,7 @@ async function withTimeout<T>(
   }
 }
 
-// ─── 重试（最多 1 次，抖动 800–1600ms）─────────────────────────────
+// ── 重试（最多 1 次，抖动 800–1600ms）────────────────────────────────────────
 
 const jitter = (min = 800, max = 1600) => min + Math.random() * (max - min)
 
@@ -137,50 +136,53 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
     const err = e instanceof AIError ? e : normalizeError(e)
     if (!RETRIABLE_CODES.includes(err.code)) throw err
     await new Promise((r) => setTimeout(r, jitter()))
-    return fn() // 不递归，仅 1 次
+    return fn() // 仅重试 1 次，不递归
   }
 }
 
-// ─── 简易熔断（连续失败 N 次后冷却期内直接短路）────────────────────
+// ── 简易熔断 ──────────────────────────────────────────────────────────────────
 
 class CircuitBreaker {
   private consecutiveFailures = 0
   private cooldownUntil = 0
+
   constructor(
     private readonly threshold = 5,
     private readonly cooldownMs = 30_000,
   ) {}
 
-  isOpen(): boolean {
-    return Date.now() < this.cooldownUntil
+  isOpen(now: number = Date.now()): boolean {
+    return now < this.cooldownUntil
   }
 
-  onSuccess() {
+  onSuccess(): void {
     this.consecutiveFailures = 0
     this.cooldownUntil = 0
   }
 
-  onFailure() {
+  onFailure(now: number = Date.now()): void {
     this.consecutiveFailures += 1
     if (this.consecutiveFailures >= this.threshold) {
-      this.cooldownUntil = Date.now() + this.cooldownMs
+      this.cooldownUntil = now + this.cooldownMs
     }
   }
 }
 
-// ─── Router 主类 ───────────────────────────────────────────────────
+// ── Router ────────────────────────────────────────────────────────────────────
 
 export interface AIProviderRouterOptions {
-  /** 实际供应商 adapter（QwenAdapter / DoubaoAdapter / createMockAIProvider()） */
+  /** 实际供应商 adapter（qwen / bff-http / mock） */
   adapter: AIProvider
-  /** 关闭熔断（测试常用） */
+  /** 关闭熔断（单测常用） */
   disableCircuitBreaker?: boolean
+  /** 注入退避函数（单测可置为立即执行）；默认 800–1600ms 随机抖动 */
+  retryDelay?: () => Promise<void>
 }
 
 export class AIProviderRouter implements AIProvider {
   private breaker = new CircuitBreaker()
 
-  constructor(private opts: AIProviderRouterOptions) {}
+  constructor(private readonly opts: AIProviderRouterOptions) {}
 
   private async run<T>(
     endpoint: Endpoint,
@@ -191,14 +193,33 @@ export class AIProviderRouter implements AIProvider {
       throw new AIError('RATE_LIMITED', 'Circuit breaker open (too many recent failures)')
     }
     const timeoutMs = timeoutFor(endpoint)
+    const delay = this.opts.retryDelay
     try {
-      const result = await withRetry(() => withTimeout(fn, timeoutMs, outerSignal))
+      const result = delay
+        ? await this.runWithInjectedDelay(fn, timeoutMs, outerSignal, delay)
+        : await withRetry(() => withTimeout(fn, timeoutMs, outerSignal))
       this.breaker.onSuccess()
       return result
     } catch (e) {
       this.breaker.onFailure()
       throw e instanceof AIError ? e : normalizeError(e)
     }
+  }
+
+  /** 测试用：用注入的 delay 替换默认抖动 */
+  private runWithInjectedDelay<T>(
+    fn: (signal: AbortSignal) => Promise<T>,
+    timeoutMs: number,
+    outerSignal: AbortSignal | undefined,
+    delay: () => Promise<void>,
+  ): Promise<T> {
+    const attempt = () => withTimeout(fn, timeoutMs, outerSignal)
+    return attempt().catch(async (e) => {
+      const err = e instanceof AIError ? e : normalizeError(e)
+      if (!RETRIABLE_CODES.includes(err.code)) throw err
+      await delay()
+      return attempt()
+    })
   }
 
   recognizeDish(req: RecognizeReq, signal?: AbortSignal): Promise<RecognizeResp> {

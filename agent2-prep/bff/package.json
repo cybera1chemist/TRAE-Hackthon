@@ -1,0 +1,16 @@
+{
+  "name": "fooddex-bff",
+  "description": "FoodDex AI 转发 BFF —— 本地 dev 中间件 + 生产 edge function",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:mock": "echo 'BFF dev middleware is loaded via vite.config.ts configureServer; see dev-middleware.ts' && exit 0",
+    "deploy:alibaba-fc": "echo 'TODO: install @alicloud/fc3-sdk and wire GitHub Actions deploy' && exit 1",
+    "deploy:cloudflare": "echo 'TODO: install wrangler && wrangler deploy' && exit 1"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.8.6"
+  }
+}

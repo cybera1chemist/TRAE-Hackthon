@@ -27,17 +27,23 @@ import type {
   MenuScan,
   OcrItem,
   Photo,
-  PhotoRefType,
   Restaurant,
   UserProfile,
 } from '@/domain/entities'
-import { isAvoidLog } from '@/domain/entities/common'
+import { recomputeDish as deriveDish } from '@/domain/services/rating'
+import { aggregateRestaurantStats } from '@/domain/services/restaurantStats'
+import { guardDishPatch } from '@/domain/services/nameGuard'
+import {
+  createDish as factoryCreateDish,
+  createLog as factoryCreateLog,
+  createOcrItem as factoryCreateOcrItem,
+  createPhoto as factoryCreatePhoto,
+  createLogPhoto as factoryCreateLogPhoto,
+  createMenuScan as factoryCreateMenuScan,
+  createRestaurant as factoryCreateRestaurant,
+} from '@/domain/factories'
 
 const now = () => new Date().toISOString()
-const rand = () => Math.random().toString(36).slice(2, 10)
-
-let seq = 0
-const genId = (prefix: string) => `${prefix}_${(++seq).toString(36)}${rand()}`
 
 /** 故障注入：下一次 addMany 中途抛错（供回滚测试） */
 export interface InMemoryDbOptions {
@@ -80,38 +86,13 @@ export class InMemoryDb {
   }
 }
 
-// ── 派生字段重算（对齐 TDD §4.2 recomputeDerived / §3.3 解锁与避雷判定） ─────
+// ── 派生字段重算（领域纯服务单一来源，TDD §4.2 / §3.3） ─────────────────────
 
 function recomputeDish(db: InMemoryDb, dishId: ID): void {
   const dish = db.dishes.get(dishId)
   if (!dish) return
-  const logs = [...db.logs.values()]
-    .filter((l) => l.dishId === dishId)
-    .sort((a, b) => a.ateAt.localeCompare(b.ateAt))
-
-  const rated = logs.filter((l) => l.rating !== null)
-  const avg =
-    rated.length === 0 ? null : rated.reduce((s, l) => s + (l.rating ?? 0), 0) / rated.length
-  const latest = logs[logs.length - 1]
-  const derivedAvoid = logs.some((l) => isAvoidLog(l.rating, l.manualAvoid))
-  const hasLogs = logs.length > 0
-
-  db.dishes.set(dishId, {
-    ...dish,
-    // 解锁 = 存在 ≥1 条 Log；删光回 locked（T1-05 验收）
-    status: hasLogs ? 'unlocked' : 'locked',
-    unlockedAt: hasLogs ? (dish.unlockedAt ?? logs[0]?.createdAt) : undefined,
-    firstLogId: hasLogs ? (dish.firstLogId ?? logs[0]?.id) : undefined,
-    // 无 Log 时保留用户手动标记的 isAvoid；有 Log 以聚合结果为准（撤销避雷重算全部 Log）
-    isAvoid: hasLogs ? derivedAvoid : dish.isAvoid,
-    stats: {
-      logCount: logs.length,
-      avgRating: avg === null ? null : Math.round(avg * 10) / 10,
-      latestRating: latest?.rating ?? null,
-      latestLogAt: latest?.ateAt,
-    },
-    updatedAt: now(),
-  })
+  const logs = [...db.logs.values()].filter((l) => l.dishId === dishId)
+  db.dishes.set(dishId, deriveDish(dish, logs, now()))
   recomputeRestaurant(db, dish.restaurantId)
 }
 
@@ -120,20 +101,10 @@ function recomputeRestaurant(db: InMemoryDb, rid: ID): void {
   if (!r) return
   const dishes = [...db.dishes.values()].filter((d) => d.restaurantId === rid)
   const logs = [...db.logs.values()].filter((l) => l.restaurantId === rid)
-  const rated = logs.filter((l) => l.rating !== null)
   db.restaurants.set(rid, {
     ...r,
     dishIds: dishes.map((d) => d.id),
-    stats: {
-      dishTotal: dishes.length,
-      unlockedCount: dishes.filter((d) => d.status === 'unlocked').length,
-      avoidCount: dishes.filter((d) => d.isAvoid).length,
-      avgRating:
-        rated.length === 0
-          ? null
-          : Math.round((rated.reduce((s, l) => s + (l.rating ?? 0), 0) / rated.length) * 10) / 10,
-      logCount: logs.length,
-    },
+    stats: aggregateRestaurantStats(dishes, logs),
     updatedAt: now(),
   })
 }
@@ -141,65 +112,21 @@ function recomputeRestaurant(db: InMemoryDb, rid: ID): void {
 // ── 工厂 ─────────────────────────────────────────────────────────────────────
 
 function createRestaurant(db: InMemoryDb, input: RestaurantInput): Restaurant {
-  const r: Restaurant = {
-    id: genId('rst'),
-    name: input.name,
-    aliases: input.aliases ?? [],
-    city: input.city,
-    district: input.district,
-    address: input.address,
-    coverPhotoId: input.coverPhotoId,
-    dishIds: [],
-    stats: { dishTotal: 0, unlockedCount: 0, avoidCount: 0, avgRating: null, logCount: 0 },
-    createdAt: now(),
-    updatedAt: now(),
-    syncState: 'local_only',
-  }
+  const r = factoryCreateRestaurant(input, now())
   db.restaurants.set(r.id, r)
   return r
 }
 
 function createDish(db: InMemoryDb, rid: ID, input: DishInput): Dish {
-  const d: Dish = {
-    id: genId('dsh'),
-    restaurantId: rid,
-    name: input.name,
-    nameSource: input.nameSource,
-    aiSuggestedName: input.aiSuggestedName,
-    canonicalDishId: input.canonicalDishId,
-    section: input.section,
-    aliases: input.aliases ?? [],
-    prices: input.prices ?? [],
-    status: 'locked',
-    isAvoid: false,
-    stats: { logCount: 0, avgRating: null, latestRating: null },
-    tags: [],
-    createdAt: now(),
-    updatedAt: now(),
-  }
+  const d = factoryCreateDish(rid, input, now())
   db.dishes.set(d.id, d)
   recomputeRestaurant(db, rid)
   return d
 }
 
-function attachPhotos(
-  db: InMemoryDb,
-  refType: PhotoRefType,
-  refId: ID,
-  inputs: AddLogPhotoInput[],
-): ID[] {
+function attachLogPhotos(db: InMemoryDb, logId: ID, inputs: AddLogPhotoInput[]): ID[] {
   return inputs.map((p) => {
-    const ph: Photo = {
-      id: p.id ?? genId('pho'),
-      refType,
-      refId,
-      blobKey: p.blobKey,
-      width: p.width,
-      height: p.height,
-      sizeBytes: p.sizeBytes,
-      isCover: p.isCover ?? false,
-      createdAt: now(),
-    }
+    const ph = factoryCreateLogPhoto(logId, p, now())
     db.photos.set(ph.id, ph)
     return ph.id
   })
@@ -324,25 +251,9 @@ function makeDishRepo(db: InMemoryDb): DishRepo {
     async update(id, patch) {
       const d = db.dishes.get(id)
       if (!d) throw new Error(`dish not found: ${id}`)
-      // nameSource==='user' 的人工菜名保护（TDD §6）：AI/OCR 不得直接覆盖 name
-      if (
-        d.nameSource === 'user' &&
-        patch.name &&
-        patch.nameSource &&
-        patch.nameSource !== 'user'
-      ) {
-        db.dishes.set(id, {
-          ...d,
-          ...patch,
-          name: d.name,
-          nameSource: d.nameSource,
-          aiSuggestedName: patch.name,
-          id: d.id,
-          updatedAt: now(),
-        })
-        return
-      }
-      db.dishes.set(id, { ...d, ...patch, id: d.id, updatedAt: now() })
+      // 人工菜名保护统一走领域服务（TDD §6 nameGuard）
+      const guarded = guardDishPatch(d, patch)
+      db.dishes.set(id, { ...d, ...guarded, id: d.id, updatedAt: now() })
     },
     async recomputeDerived(dishId) {
       recomputeDish(db, dishId)
@@ -369,26 +280,11 @@ function makeLogRepo(db: InMemoryDb): LogRepo {
         for (const input of inputs) {
           const dish = db.dishes.get(input.dishId)
           if (!dish) throw new Error(`dish not found: ${input.dishId}`)
-          const log: Log = {
-            id: genId('log'),
-            dishId: input.dishId,
-            restaurantId: input.restaurantId,
-            canonicalDishId: dish.canonicalDishId,
-            rating: input.rating,
-            manualAvoid: input.manualAvoid,
-            comment: input.comment ?? '',
-            price: input.price ?? null,
-            scene: input.scene,
-            ateAt: input.ateAt,
-            photoIds: [],
-            aiSnapshot: input.aiSnapshot,
-            tagExtractionState: 'pending',
-            createdAt: now(),
-            updatedAt: now(),
-          }
+          const log = factoryCreateLog(input, now())
+          log.canonicalDishId = dish.canonicalDishId
           db.logs.set(log.id, log)
           // 图片行挂在 Log 下（PRD §7.6：Photo.refType='log', refId=log.id）
-          log.photoIds = attachPhotos(db, 'log', log.id, input.photos ?? [])
+          log.photoIds = attachLogPhotos(db, log.id, input.photos ?? [])
           out.push(log)
           recomputeDish(db, input.dishId)
         }
@@ -423,12 +319,7 @@ function makeLogRepo(db: InMemoryDb): LogRepo {
 function makePhotoRepo(db: InMemoryDb): PhotoRepo {
   return {
     async attach(meta: PhotoInput) {
-      const p: Photo = {
-        ...meta,
-        id: meta.id ?? genId('pho'),
-        isCover: meta.isCover ?? false,
-        createdAt: now(),
-      }
+      const p = factoryCreatePhoto(meta, now())
       db.photos.set(p.id, p)
       return p
     },
@@ -447,14 +338,7 @@ function makePhotoRepo(db: InMemoryDb): PhotoRepo {
 function makeMenuScanRepo(db: InMemoryDb): MenuScanRepo {
   return {
     async create(input) {
-      const s: MenuScan = {
-        id: genId('scan'),
-        restaurantId: input.restaurantId,
-        sourceImageIds: input.sourceImageIds,
-        status: 'pending',
-        isIncremental: input.isIncremental,
-        createdAt: now(),
-      }
+      const s = factoryCreateMenuScan(input, now())
       db.menuScans.set(s.id, s)
       return s
     },
@@ -473,19 +357,20 @@ function makeMenuScanRepo(db: InMemoryDb): MenuScanRepo {
     },
     async addOcrItems(scanId, items) {
       const out: OcrItem[] = items.map((it) => {
-        const o: OcrItem = {
-          id: genId('ocr'),
-          scanId,
-          sourceImageId: it.sourceImageId,
-          section: it.section,
-          rawText: it.rawText,
-          normalizedName: it.normalizedName,
-          price: it.price,
-          confidence: it.confidence,
-          bbox: it.bbox,
-          matchResult: it.matchResult,
-          createdAt: now(),
-        }
+        const o = factoryCreateOcrItem(
+          {
+            scanId,
+            sourceImageId: it.sourceImageId,
+            section: it.section,
+            rawText: it.rawText,
+            normalizedName: it.normalizedName,
+            price: it.price,
+            confidence: it.confidence,
+            bbox: it.bbox,
+            matchResult: it.matchResult,
+          },
+          now(),
+        )
         db.ocrItems.set(o.id, o)
         return o
       })

@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+/* 主题变量与字体方案由入口按序引入：main.tsx → index.css / theme.css / fonts.css */
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-bg font-sans text-ink antialiased;
+  }
+
+  /* 触控目标 ≥ 44px（PRD §9 可访问性）由组件自身保证 */
+  :focus-visible {
+    @apply outline-none ring-2 ring-primary/60 ring-offset-2 ring-offset-bg;
+  }
+}

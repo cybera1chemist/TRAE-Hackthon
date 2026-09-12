@@ -1,0 +1,16 @@
+/**
+ * Web Font 方案（T0-07）：
+ * 1. 正文使用系统字体栈（tailwind.config.ts font-sans），零加载成本、无授权风险；
+ * 2. 图鉴/出片标题使用 font-display（--font-display），当前回退到衬线宋体系；
+ * 3. 出片标题字（Agent-6 / T5）：将【可商用且已子集化】的 woff2 放入 public/fonts/，
+ *    并解除下方 @font-face 注释即可生效。严禁引用外部字体站 CDN（TDD §10 授权风险）。
+ *
+ * 示例（子集化后通常 < 300KB）：
+ * @font-face {
+ *   font-family: 'FoodDex Display';
+ *   src: url('/fonts/fooddex-display-subset.woff2') format('woff2');
+ *   font-weight: 400 900;
+ *   font-display: swap;
+ *   unicode-range: U+4E00-9FFF, U+3000-303F, U+0020-007E;
+ * }
+ */

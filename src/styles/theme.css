@@ -1,0 +1,50 @@
+/**
+ * 主题变量（T0-05）：图鉴配色 —— 浅色「米白纸面 + 墨绿/烫金」（PRD §8.4 模板 A），
+ * 暗色「深紫黑 + 霓虹红/青」（模板 B 霓虹夜市）。
+ * 颜色以空格分隔 RGB 三元组存储，Tailwind 中经 rgb(var(--c-x) / <alpha-value>) 消费；
+ * 切换方式：<html class="dark">（index.html 内联脚本首帧前同步）。
+ */
+:root {
+  /* 画布与表面 */
+  --c-bg: 250 247 240; /* #FAF7F0 米白纸面 */
+  --c-surface: 255 255 255;
+  --c-surface-2: 245 241 232; /* 纸面凹陷区 */
+  --c-ink: 38 50 45; /* 墨绿黑 */
+  --c-ink-muted: 122 134 127;
+  --c-line: 223 216 202; /* 纸面描边 */
+
+  /* 品牌色 */
+  --c-primary: 47 93 80; /* 墨绿 */
+  --c-primary-fg: 250 247 240;
+  --c-gold: 176 141 56; /* 烫金（编号/等级/高分） */
+
+  /* 语义色 */
+  --c-avoid: 214 69 65; /* 避雷红（角标/横幅） */
+  --c-locked: 156 163 175; /* 未解锁灰 */
+
+  /* 暗色专用点缀（浅色下也可用作出片强调） */
+  --c-neon-red: 255 77 109;
+  --c-neon-cyan: 34 211 238;
+
+  /* 字体 */
+  --font-display: 'FoodDex Display', 'Noto Serif SC', 'Songti SC', 'STSong', Georgia, serif;
+}
+
+.dark {
+  --c-bg: 18 16 28; /* #12101C 深紫黑 */
+  --c-surface: 26 22 37; /* #1A1625 */
+  --c-surface-2: 38 32 52;
+  --c-ink: 237 233 244;
+  --c-ink-muted: 148 142 165;
+  --c-line: 55 47 74;
+
+  --c-primary: 34 211 238; /* 霓虹青（暗色主操作色，对比度达标 WCAG AA） */
+  --c-primary-fg: 18 16 28;
+  --c-gold: 212 175 85;
+
+  --c-avoid: 255 107 107;
+  --c-locked: 120 113 138;
+
+  --c-neon-red: 255 77 109;
+  --c-neon-cyan: 34 211 238;
+}

@@ -17,8 +17,9 @@ function createAppRouter(): Router {
       children: [
         // T1-09：Agent-3 自助合入（片段见 src/pages/home/route.ts），待 Agent-0 复核
         { path: '/', lazy: () => import('@/pages/home/HomePage') },
-        { path: '/dex', lazy: () => import('./placeholders/dex') },
-        { path: '/insights', lazy: () => import('./placeholders/insights') },
+        // T1-10/T4-02：Agent-5 自助合入（片段见 src/pages/{dex,insights}/route.ts），待 Agent-0 复核
+        { path: '/dex', lazy: () => import('@/pages/dex/DexPage') },
+        { path: '/insights', lazy: () => import('@/pages/insights/InsightsPage') },
         { path: '/settings', lazy: () => import('./placeholders/settings') },
       ],
     },
@@ -28,8 +29,9 @@ function createAppRouter(): Router {
         // T2-03~08：Agent-3 自助合入（片段见 src/pages/capture/route.ts），待 Agent-0 复核
         { path: '/capture', lazy: () => import('@/pages/capture/CapturePage') },
         { path: '/scan/:rid?', lazy: () => import('./placeholders/scan') },
-        { path: '/restaurant/:rid', lazy: () => import('./placeholders/restaurant') },
-        { path: '/dish/:id', lazy: () => import('./placeholders/dish') },
+        // T1-11/T3-07：Agent-5 自助合入（片段见 src/pages/{restaurant,dish}/route.ts），待 Agent-0 复核
+        { path: '/restaurant/:rid', lazy: () => import('@/pages/restaurant/RestaurantPage') },
+        { path: '/dish/:id', lazy: () => import('@/pages/dish/DishPage') },
       ],
     },
   ])

@@ -15,7 +15,8 @@ function createAppRouter(): Router {
       element: <AppShell />,
       errorElement: <RouteError />,
       children: [
-        { path: '/', lazy: () => import('./placeholders/home') },
+        // T1-09：Agent-3 自助合入（片段见 src/pages/home/route.ts），待 Agent-0 复核
+        { path: '/', lazy: () => import('@/pages/home/HomePage') },
         { path: '/dex', lazy: () => import('./placeholders/dex') },
         { path: '/insights', lazy: () => import('./placeholders/insights') },
         { path: '/settings', lazy: () => import('./placeholders/settings') },

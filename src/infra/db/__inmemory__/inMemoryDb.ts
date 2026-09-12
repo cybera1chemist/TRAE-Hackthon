@@ -313,6 +313,15 @@ function makeLogRepo(db: InMemoryDb): LogRepo {
       for (const p of log.photoIds) db.photos.delete(p)
       recomputeDish(db, log.dishId)
     },
+    // v1.1 契约追加（T2-05）：见 repositories.ts LogRepo 注释
+    async get(id) {
+      return db.logs.get(id)
+    },
+    async update(id, patch) {
+      const log = db.logs.get(id)
+      if (!log) throw new Error(`log not found: ${id}`)
+      db.logs.set(id, { ...log, ...patch, id: log.id, createdAt: log.createdAt })
+    },
   }
 }
 

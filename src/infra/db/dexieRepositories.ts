@@ -254,6 +254,17 @@ export function createDexieRepositories(db: FoodDexDatabase): Repositories {
         await refreshDish(log.dishId)
       })
     },
+    // v1.1 契约追加（T2-05）：见 repositories.ts LogRepo 注释
+    async get(id) {
+      return t.logs.get(id)
+    },
+    async update(id, patch) {
+      await db.transaction('rw', t.logs, async () => {
+        const log = await t.logs.get(id)
+        if (!log) throw new Error(`log not found: ${id}`)
+        await t.logs.put({ ...log, ...patch, id: log.id, createdAt: log.createdAt })
+      })
+    },
   }
 
   // ── Photo ─────────────────────────────────────────────────────────────────

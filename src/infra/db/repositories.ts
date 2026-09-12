@@ -120,6 +120,14 @@ export interface LogRepo {
   listAll(limit?: number): Promise<Log[]>
   /** 删除后须触发 recomputeDerived（TDD §4.2） */
   remove(id: string): Promise<void>
+  // ── v1.1 契约追加（append-only，T2-05 标签回填依赖；@Agent-0/Agent-1 知悉）──
+  /** 按 ID 读取单条 Log（AsyncQueue extractTags 处理器定位任务目标） */
+  get(id: string): Promise<Log | undefined>
+  /**
+   * 受控字段更新：仅限 tagExtractionState 等非派生字段（标签回填 markDone/markFailed）。
+   * 禁止绕过事务直接改 photoIds 等关联字段；派生字段一律走 recomputeDerived。
+   */
+  update(id: string, patch: Partial<Omit<Log, 'id' | 'createdAt'>>): Promise<void>
 }
 
 // ── 追加接口（批次 3 所需，v1 范围内） ────────────────────────────────────────

@@ -1,0 +1,9 @@
+dist
+node_modules
+coverage
+playwright-report
+test-results
+pnpm-lock.yaml
+.husky/_
+agent1-prep
+*.md

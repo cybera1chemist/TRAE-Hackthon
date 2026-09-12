@@ -160,6 +160,52 @@ describe('Dexie 打卡全链路（T1-03 契约）', () => {
     // Blob 本体在业务事务外（先 put），不回滚——这是设计约定
     expect(await blobStore.get(key)).toBeDefined()
   })
+
+  it('DishRepo.remove：级联删 Log/Photo/dish 图并重算店铺；keepLogs 保留 Log（EC-MENU-05）', async () => {
+    const r = await seedRestaurant()
+    const d1 = await repos.dishes.create(r.id, { name: '下架菜', nameSource: 'ocr' })
+    const d2 = await repos.dishes.create(r.id, { name: '在售菜', nameSource: 'ocr' })
+    const key = await blobStore.put('rm1', blobOf(8))
+    const [log] = await repos.logs.addMany([
+      {
+        dishId: d1.id,
+        restaurantId: r.id,
+        rating: 4,
+        manualAvoid: false,
+        ateAt: '2024-06-01T12:00:00Z',
+        photos: [{ blobKey: key, width: 1, height: 1, sizeBytes: 8 }],
+      },
+    ])
+    await repos.photos.attach({
+      refType: 'dish',
+      refId: d1.id,
+      blobKey: key,
+      width: 1,
+      height: 1,
+      sizeBytes: 8,
+    })
+
+    await repos.dishes.remove(d1.id, {})
+    expect(await repos.dishes.get(d1.id)).toBeUndefined()
+    expect(await repos.logs.listByDish(d1.id)).toHaveLength(0)
+    expect(await repos.photos.get(log.photoIds[0])).toBeUndefined()
+    expect(await db.photos.count()).toBe(0)
+    expect((await repos.restaurants.get(r.id))?.dishIds).toEqual([d2.id])
+
+    // keepLogs=true：仅删菜品行与 dish 级图片，打卡记录保留
+    const [log2] = await repos.logs.addMany([
+      {
+        dishId: d2.id,
+        restaurantId: r.id,
+        rating: 5,
+        manualAvoid: false,
+        ateAt: '2024-06-02T12:00:00Z',
+      },
+    ])
+    await repos.dishes.remove(d2.id, { keepLogs: true })
+    expect(await repos.dishes.get(d2.id)).toBeUndefined()
+    expect(await repos.logs.get(log2.id)).toBeDefined()
+  })
 })
 
 describe('upsertFromOcr（无决议不入库，PRD §7.7）', () => {

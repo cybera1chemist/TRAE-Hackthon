@@ -169,12 +169,24 @@ export function createDexieRepositories(db: FoodDexDatabase): Repositories {
         for (const item of items) {
           // 人工保护：无用户决议不允许入库（PRD §7.7）
           if (!item.userDecision) continue
-          if (item.matchType === 'exact' && item.targetDishId) {
-            const existing = await t.dishes.get(item.targetDishId)
-            if (existing) {
-              linked.push(existing.id)
-              continue
+          // exact 自动关联；fuzzy 经用户确认合并（merged）同样挂到现存菜（TDD §3.4：fuzzy 合并）
+          const linkedTarget =
+            (item.matchType === 'exact' ||
+              (item.matchType === 'fuzzy' && item.userDecision === 'merged')) &&
+            item.targetDishId != null
+              ? await t.dishes.get(item.targetDishId)
+              : undefined
+          if (linkedTarget) {
+            // OCR 名与现名不同时仅作建议，不覆盖（EC-MENU-06 人工保护）
+            if (item.name !== linkedTarget.name) {
+              await t.dishes.put({
+                ...linkedTarget,
+                aiSuggestedName: item.name,
+                updatedAt: isoNow(),
+              })
             }
+            linked.push(linkedTarget.id)
+            continue
           }
           const d = createDish(rid, {
             name: item.name,
@@ -204,6 +216,23 @@ export function createDexieRepositories(db: FoodDexDatabase): Repositories {
     },
     async recomputeDerived(dishId) {
       await refreshDish(dishId)
+    },
+    async remove(id, opts) {
+      await db.transaction('rw', [t.dishes, t.logs, t.photos, t.restaurants], async () => {
+        const d = await t.dishes.get(id)
+        if (!d) return
+        if (!opts.keepLogs) {
+          const dishLogs = await t.logs.where('dishId').equals(id).toArray()
+          for (const log of dishLogs) {
+            await t.photos.bulkDelete(log.photoIds)
+            await t.logs.delete(log.id)
+          }
+        }
+        const dishPhotos = await t.photos.where('refId').equals(id).toArray()
+        await t.photos.bulkDelete(dishPhotos.filter((p) => p.refType === 'dish').map((p) => p.id))
+        await t.dishes.delete(id)
+        await refreshRestaurant(d.restaurantId)
+      })
     },
   }
 

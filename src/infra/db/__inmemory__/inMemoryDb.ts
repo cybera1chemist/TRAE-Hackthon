@@ -224,12 +224,24 @@ function makeDishRepo(db: InMemoryDb): DishRepo {
       for (const item of items) {
         // 人工保护：无用户决议不允许入库（PRD §7.7）
         if (!item.userDecision) continue
-        if (item.matchType === 'exact' && item.targetDishId) {
-          const d = db.dishes.get(item.targetDishId)
-          if (d) {
-            linked.push(d.id)
-            continue
+        // exact 自动关联；fuzzy 经用户确认合并（merged）同样挂到现存菜（TDD §3.4：fuzzy 合并）
+        const linkedTarget =
+          (item.matchType === 'exact' ||
+            (item.matchType === 'fuzzy' && item.userDecision === 'merged')) &&
+          item.targetDishId != null
+            ? db.dishes.get(item.targetDishId)
+            : undefined
+        if (linkedTarget) {
+          // OCR 名与现名不同时仅作建议，不覆盖（EC-MENU-06 人工保护）
+          if (item.name !== linkedTarget.name) {
+            db.dishes.set(linkedTarget.id, {
+              ...linkedTarget,
+              aiSuggestedName: item.name,
+              updatedAt: now(),
+            })
           }
+          linked.push(linkedTarget.id)
+          continue
         }
         const d = createDish(db, rid, {
           name: item.name,
@@ -257,6 +269,23 @@ function makeDishRepo(db: InMemoryDb): DishRepo {
     },
     async recomputeDerived(dishId) {
       recomputeDish(db, dishId)
+    },
+    async remove(id, opts) {
+      const d = db.dishes.get(id)
+      if (!d) return
+      if (!opts.keepLogs) {
+        for (const l of [...db.logs.values()].filter((l) => l.dishId === id)) {
+          for (const p of l.photoIds) db.photos.delete(p)
+          db.logs.delete(l.id)
+        }
+      }
+      for (const p of [...db.photos.values()].filter(
+        (p) => p.refType === 'dish' && p.refId === id,
+      )) {
+        db.photos.delete(p.id)
+      }
+      db.dishes.delete(id)
+      recomputeRestaurant(db, d.restaurantId)
     },
   }
 }

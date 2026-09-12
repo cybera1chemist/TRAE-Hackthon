@@ -135,4 +135,38 @@ describe('InMemory 假打卡全链路', () => {
     expect(after?.aiSuggestedName).toBe('AI 建议名')
     expect(after?.nameSource).toBe('user')
   })
+
+  it('DishRepo.remove：级联删 Log/图片行并重算店铺；keepLogs 仅删菜品行（EC-MENU-05）', async () => {
+    const { repos } = ctx
+    const r = await repos.restaurants.create({ name: 'E' })
+    const d1 = await repos.dishes.create(r.id, { name: '下架菜', nameSource: 'ocr' })
+    const d2 = await repos.dishes.create(r.id, { name: '在售菜', nameSource: 'ocr' })
+    const [log] = await repos.logs.addMany([
+      {
+        dishId: d1.id,
+        restaurantId: r.id,
+        rating: 4,
+        manualAvoid: false,
+        ateAt,
+        photos: [photoInput],
+      },
+    ])
+    await repos.photos.attach({ refType: 'dish', refId: d1.id, ...photoInput })
+
+    await repos.dishes.remove(d1.id, {})
+    expect(await repos.dishes.get(d1.id)).toBeUndefined()
+    expect(await repos.logs.listByDish(d1.id)).toHaveLength(0)
+    expect(await repos.photos.get(log.photoIds[0])).toBeUndefined()
+    const rs = await repos.restaurants.get(r.id)
+    expect(rs?.dishIds).toEqual([d2.id])
+    expect(rs?.stats).toMatchObject({ dishTotal: 1, logCount: 0 })
+
+    // keepLogs=true：仅删菜品行与 dish 级图片，打卡记录保留
+    const [log2] = await repos.logs.addMany([
+      { dishId: d2.id, restaurantId: r.id, rating: 5, manualAvoid: false, ateAt },
+    ])
+    await repos.dishes.remove(d2.id, { keepLogs: true })
+    expect(await repos.dishes.get(d2.id)).toBeUndefined()
+    expect((await repos.logs.get(log2.id))?.id).toBe(log2.id)
+  })
 })

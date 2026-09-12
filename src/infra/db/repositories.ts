@@ -110,6 +110,13 @@ export interface DishRepo {
   update(id: string, patch: Partial<Omit<Dish, 'id' | 'createdAt'>>): Promise<void>
   /** 由 logs 重算 status/isAvoid/stats 派生字段（TDD §4.2） */
   recomputeDerived(dishId: string): Promise<void>
+  // ── v1.1 契约追加（append-only，增量扫描 EC-MENU-05 依赖；@Agent-1 知悉）──
+  /**
+   * 用户确认后的物理删除（TDD §3.4：removed 仅标记，确认后才删）。
+   * keepLogs=false（默认）级联删除该菜全部打卡 Log 与其图片行，并重算店铺统计；
+   * keepLogs=true 仅删除菜品行与 dish 级图片（Log 保留，由调用方负责孤儿处理）。
+   */
+  remove(id: string, opts: { keepLogs?: boolean }): Promise<void>
 }
 
 export interface LogRepo {
